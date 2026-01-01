@@ -1,413 +1,340 @@
-import "dotenv/config";
-import express from "express";
-import TelegramBot from "node-telegram-bot-api";
-import crypto from "crypto";
-import dayjs from "dayjs";
-import utc from "dayjs/plugin/utc.js";
-import timezone from "dayjs/plugin/timezone.js";
+require("dotenv").config();
 
-dayjs.extend(utc);
-dayjs.extend(timezone);
+const http = require("http");
+const crypto = require("crypto");
+const axios = require("axios");
+const sharp = require("sharp");
+const TelegramBot = require("node-telegram-bot-api");
 
-// =====================
-// ENV
-// =====================
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+/* =========================
+   ENV
+========================= */
+const token = process.env.TELEGRAM_BOT_TOKEN;
+if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
+
+const PUBLIC_URL = process.env.PUBLIC_URL; // مثال: https://deal-jsyn.onrender.com
+if (!PUBLIC_URL) throw new Error("Missing PUBLIC_URL");
+
+// AliExpress Open Platform keys (من openservice)
 const AE_APP_KEY = process.env.AE_APP_KEY;
 const AE_APP_SECRET = process.env.AE_APP_SECRET;
-const AE_TRACKING_ID = process.env.AE_TRACKING_ID; // Tracking ID من AliExpress Portals
-const AE_GATEWAY = process.env.AE_GATEWAY; // مهم! خليه https://api-sg.aliexpress.com/sync
+const TRACKING_ID = process.env.TRACKING_ID || ""; // اختياري لبعض الحسابات
 
-if (!TELEGRAM_BOT_TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN");
-if (!AE_APP_KEY) console.warn("⚠️ Missing AE_APP_KEY");
-if (!AE_APP_SECRET) console.warn("⚠️ Missing AE_APP_SECRET");
-if (!AE_TRACKING_ID) console.warn("⚠️ Missing AE_TRACKING_ID (affiliate links may not work)");
-
-// Render يعطيك الرابط العام
-const PUBLIC_URL =
-  process.env.RENDER_EXTERNAL_URL ||
-  process.env.PUBLIC_URL ||
-  process.env.APP_URL ||
-  "";
-
-const PORT = Number(process.env.PORT || 10000);
-
-// =====================
-// Express (Webhook server)
-// =====================
-const app = express();
-app.use(express.json());
-
-app.get("/", (_, res) => res.status(200).send("OK"));
-
-const WEBHOOK_PATH = `/bot${TELEGRAM_BOT_TOKEN}`;
-
-// =====================
-// Telegram Bot (webhook mode)
-// =====================
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
-
-if (!PUBLIC_URL) {
-  console.warn(
-    "⚠️ PUBLIC_URL not found. On Render set env RENDER_EXTERNAL_URL automatically. If webhook doesn't work, add PUBLIC_URL=https://your.onrender.com"
-  );
-} else {
-  const webhookUrl = `${PUBLIC_URL}${WEBHOOK_PATH}`;
-  bot
-    .setWebHook(webhookUrl)
-    .then(() => console.log("Webhook set ✅"))
-    .catch((e) => console.error("Webhook set error:", e?.message || e));
+if (!AE_APP_KEY || !AE_APP_SECRET) {
+  throw new Error("Missing AE_APP_KEY or AE_APP_SECRET");
 }
 
-app.post(WEBHOOK_PATH, (req, res) => {
-  bot.processUpdate(req.body);
-  res.sendStatus(200);
+// مهم: خليها بوابة AliExpress (مش taobao)
+const AE_GATEWAY =
+  (process.env.AE_GATEWAY || "").trim() ||
+  "https://api-sg.aliexpress.com/sync";
+
+const DEBUG = String(process.env.DEBUG || "").trim() === "1";
+
+// تحويل USD→ILS اختياري
+const USD_TO_ILS_RATE = Number(process.env.USD_TO_ILS_RATE || "0");
+function usdToIls(usdStr) {
+  const usd = Number(String(usdStr).replace(/[^\d.]/g, ""));
+  if (!Number.isFinite(usd) || usd <= 0) return null;
+  if (!USD_TO_ILS_RATE || USD_TO_ILS_RATE <= 0) return null;
+  return usd * USD_TO_ILS_RATE;
+}
+
+/* =========================
+   Telegram webhook server
+========================= */
+const bot = new TelegramBot(token); // no polling
+const WEBHOOK_PATH = `/bot${token}`;
+const PORT = process.env.PORT || 10000;
+
+bot.setWebHook(`${PUBLIC_URL}${WEBHOOK_PATH}`).then(() => {
+  console.log("Webhook set ✅");
 });
 
-app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+http
+  .createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      return res.end("OK");
+    }
 
-// =====================
-// Bot UX
-// =====================
-bot.onText(/\/start/, async (msg) => {
-  await bot.sendMessage(
-    msg.chat.id,
-    `أهلًا 👋\nاكتب مثلًا:\nابحث عن ساعة ذكية\nابحث لي عن شاحن 65W`
-  );
-});
-
-bot.on("message", async (msg) => {
-  try {
-    if (!msg.text) return;
-    if (msg.text.startsWith("/start")) return;
-
-    const kw = extractKeyword(msg.text);
-    if (!kw) return;
-
-    await bot.sendChatAction(msg.chat.id, "typing");
-
-    const products = await getTop4ByOrders(kw);
-
-    if (!products || products.length < 4) {
-      await bot.sendMessage(msg.chat.id, "ما لقيت نتائج كافية. جرّب كلمة ثانية 🙂");
+    if (req.method === "POST" && req.url === WEBHOOK_PATH) {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        try {
+          const update = JSON.parse(body);
+          if (DEBUG) console.log("Incoming update ✅", update?.update_id);
+          bot.processUpdate(update);
+        } catch (e) {
+          console.error("Bad JSON update:", e.message);
+        }
+        res.writeHead(200);
+        res.end("OK");
+      });
       return;
     }
 
-    // نص مرتب
-    const lines = [];
-    for (let i = 0; i < 4; i++) {
-      const p = products[i];
-      const price = formatILS(p.price);
-      const orders = p.orders ?? "—";
-      const rating = p.rating ?? "—";
+    res.writeHead(404);
+    res.end("Not found");
+  })
+  .listen(PORT, () => console.log("Server listening on", PORT));
 
-      // رابط أفلييت (إذا فشل، بنستخدم رابط المنتج)
-      const link = (await safeAffiliateLink(p.detailUrl)) || p.detailUrl;
+console.log("Deals48 bot running (webhook mode)...");
 
-      lines.push(
-        `${["1️⃣","2️⃣","3️⃣","4️⃣"][i]} ${truncate(p.title, 70)}\n` +
-        `💰 السعر: ${price}\n` +
-        `🛒 المبيعات: ${orders}\n` +
-        `⭐ التقييم: ${rating}\n` +
-        `${link}`
-      );
-    }
+/* =========================
+   Helpers: timestamp + sign
+========================= */
 
-    await bot.sendMessage(msg.chat.id, lines.join("\n\n"), {
-      disable_web_page_preview: false,
-    });
-  } catch (e) {
-    console.error("Message handler error:", e?.message || e);
-    await bot.sendMessage(msg.chat.id, "صار خطأ بسيط. جرّب مرة ثانية 🙏");
-  }
-});
-
-function extractKeyword(text) {
-  const t = (text || "").trim();
-  // أمثلة: "ابحث عن ..." / "ابحث لي عن ..." / "ابحث ..." / "بحث ..."
-  const patterns = [
-    /^ابحث\s+لي\s+عن\s+/,
-    /^ابحث\s+عن\s+/,
-    /^ابحث\s+/,
-    /^بحث\s+عن\s+/,
-  ];
-  for (const re of patterns) {
-    if (re.test(t)) return t.replace(re, "").trim();
-  }
-  // إذا كتب كلمة مباشرة
-  if (t.length >= 2) return t;
-  return "";
-}
-
-function truncate(s, n) {
-  if (!s) return "";
-  return s.length > n ? s.slice(0, n - 1) + "…" : s;
-}
-
-function formatILS(price) {
-  if (price === null || price === undefined) return "—";
-  const num = Number(price);
-  if (Number.isFinite(num)) return `₪${num.toFixed(2)}`;
-  // إذا جاي نص
-  const p = String(price);
-  return p.includes("₪") ? p : `₪${p}`;
-}
-
-// =====================
-// AliExpress API
-// =====================
-
-// جرّب أكثر من Gateway (الأهم api-sg)
-function buildGateways() {
-  const list = [
-    AE_GATEWAY, // إذا محدد في Render
-    "https://api-sg.aliexpress.com/sync", // شائع للـ Affiliate APIs :contentReference[oaicite:2]{index=2}
-    // احتياط (قد يفيد لبعض الحسابات القديمة، لكنه قد يعطي appkey-not-exists)
-    "https://eco.taobao.com/router/rest",
-    "https://gw.api.taobao.com/router/rest",
-  ].filter(Boolean);
-
-  // إزالة تكرار
-  return [...new Set(list)];
+// Shanghai timestamp بدون مكتبات إضافية
+function shanghaiTimestamp() {
+  // sv-SE يعطي فورمات: YYYY-MM-DD HH:mm:ss
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(new Date());
 }
 
 function md5Upper(s) {
   return crypto.createHash("md5").update(s, "utf8").digest("hex").toUpperCase();
 }
 
-function sortKeys(obj) {
-  return Object.keys(obj)
-    .sort()
-    .reduce((acc, k) => {
-      acc[k] = obj[k];
-      return acc;
-    }, {});
-}
-
-// توقيع “TOP style”: keyvaluekeyvalue (مثل شروحات كثيرة) :contentReference[oaicite:3]{index=3}
+// توقيع TOP-style: secret + (k+v...) + secret
 function signTopPairs(params, secret) {
-  const sorted = sortKeys({ ...params });
-  delete sorted.sign;
-
-  let long = "";
-  for (const k of Object.keys(sorted)) {
-    const v = sorted[k];
+  const sortedKeys = Object.keys(params).sort();
+  let base = secret;
+  for (const k of sortedKeys) {
+    const v = params[k];
     if (v === undefined || v === null || v === "") continue;
-    long += `${k}${v}`;
+    base += `${k}${v}`;
   }
-  return md5Upper(`${secret}${long}${secret}`);
+  base += secret;
+  return md5Upper(base);
 }
 
-// توقيع “querystring style”: key=value&key=value (يظهر في أمثلة كثيرة للـ /sync)
-function signQueryString(params, secret) {
-  const sorted = sortKeys({ ...params });
-  delete sorted.sign;
-
-  const qs = Object.keys(sorted)
-    .filter((k) => sorted[k] !== undefined && sorted[k] !== null && sorted[k] !== "")
-    .map((k) => `${k}=${sorted[k]}`)
-    .join("&");
-
-  return md5Upper(`${secret}${qs}${secret}`);
+function sanitizeForLog(obj) {
+  const s = JSON.stringify(obj);
+  return s
+    .replace(/"sign"\s*:\s*"[^"]+"/g, '"sign":"***"')
+    .replace(/"app_key"\s*:\s*"[^"]+"/g, '"app_key":"***"')
+    .slice(0, 1400);
 }
 
 async function postForm(url, params) {
   const body = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) body.append(k, String(v));
 
-  const res = await fetch(url, {
-    method: "POST",
+  const res = await axios.post(url, body, {
     headers: { "Content-Type": "application/x-www-form-urlencoded;charset=utf-8" },
-    body,
+    timeout: 25000,
   });
 
-  const text = await res.text();
-  try {
-    return JSON.parse(text);
-  } catch {
-    return { raw: text };
-  }
+  return res.data;
 }
 
-function pickProductsFromResponse(resp) {
-  // أشكال مختلفة حسب الـ gateway
-  // Taobao/TOP:
-  // resp.aliexpress_affiliate_product_query_response?.resp_result?.result?.products?.product
-  const a =
-    resp?.aliexpress_affiliate_product_query_response?.resp_result?.result?.products?.product;
-
-  if (Array.isArray(a)) return a;
-
-  // أحيانًا تكون products.product عنصر واحد
-  if (a && typeof a === "object") return [a];
-
-  // بعض الردود قد تكون مباشرة:
-  const b = resp?.result?.products?.product;
-  if (Array.isArray(b)) return b;
-  if (b && typeof b === "object") return [b];
-
-  return [];
-}
-
-function normalizeProduct(p) {
-  const title =
-    p?.product_title || p?.title || p?.productTitle || p?.item_title || "";
-
-  const img =
-    p?.product_main_image_url || p?.productMainImageUrl || p?.image_url || p?.imageUrl || "";
-
-  const detailUrl =
-    p?.product_detail_url || p?.productDetailUrl || p?.detail_url || p?.product_url || "";
-
-  // السعر: أحيانًا sale_price مثل "US $12.34"
-  const sale = p?.sale_price || p?.target_sale_price || p?.salePrice || p?.price || "";
-  const price = extractNumber(sale);
-
-  // المبيعات: orders أو volume
-  const orders =
-    toInt(p?.orders) ??
-    toInt(p?.lastest_volume) ??
-    toInt(p?.volume) ??
-    toInt(p?.sale_num) ??
-    null;
-
-  // التقييم: evaluate_rate أو rating
-  const rating =
-    p?.evaluate_rate ||
-    p?.evaluateRate ||
-    p?.rating ||
-    p?.score ||
-    null;
-
-  return {
-    title: title || "منتج",
-    img,
-    detailUrl,
-    price,
-    orders,
-    rating,
+/* =========================
+   AliExpress Affiliate calls
+========================= */
+async function callAffiliate(method, bizParams) {
+  const params = {
+    method,
+    app_key: AE_APP_KEY,
+    sign_method: "md5",
+    format: "json",
+    v: "2.0",
+    timestamp: shanghaiTimestamp(),
+    ...bizParams,
   };
-}
 
-function extractNumber(x) {
-  if (x === null || x === undefined) return null;
-  const s = String(x);
-  const m = s.match(/(\d+(\.\d+)?)/);
-  return m ? Number(m[1]) : null;
-}
+  params.sign = signTopPairs(params, AE_APP_SECRET);
 
-function toInt(x) {
-  if (x === null || x === undefined) return null;
-  const n = Number(String(x).replace(/[^\d]/g, ""));
-  return Number.isFinite(n) ? n : null;
-}
-
-async function callAffiliate(method, extraParams) {
-  if (!AE_APP_KEY || !AE_APP_SECRET) {
-    return { error: "Missing AE_APP_KEY/AE_APP_SECRET" };
+  if (DEBUG) {
+    console.log("API CALL:", sanitizeForLog({ gw: AE_GATEWAY, method, bizParams }));
   }
 
-  const gateways = buildGateways();
+  const data = await postForm(AE_GATEWAY, params);
 
-  // جرّب نوعين timestamp + نوعين توقيع
-  const tsShanghai = dayjs().tz("Asia/Shanghai").format("YYYY-MM-DD HH:mm:ss"); // :contentReference[oaicite:4]{index=4}
-  const tsUnix = Math.floor(Date.now() / 1000);
+  // اطبع خطأ واضح إذا موجود
+  const err = data?.error_response;
+  if (err) console.log("API ERROR:", sanitizeForLog(err));
 
-  const attempts = [
-    { timestamp: tsShanghai, signFn: signTopPairs, tag: "shanghai/topPairs" },
-    { timestamp: tsShanghai, signFn: signQueryString, tag: "shanghai/queryStr" },
-    { timestamp: tsUnix, signFn: signTopPairs, tag: "unix/topPairs" },
-    { timestamp: tsUnix, signFn: signQueryString, tag: "unix/queryStr" },
-  ];
-
-  let lastResp = null;
-
-  for (const gw of gateways) {
-    for (const att of attempts) {
-      const payload = {
-        method,
-        app_key: AE_APP_KEY,
-        sign_method: "md5",
-        format: "json",
-        v: "2.0",
-        timestamp: att.timestamp,
-        ...extraParams,
-      };
-
-      const sign = att.signFn(payload, AE_APP_SECRET);
-      const full = { ...payload, sign };
-
-      // لوج مختصر بدون أسرار
-      console.log(`API TRY -> gw=${gw} method=${method} (${att.tag})`);
-
-      const resp = await postForm(gw, full);
-      lastResp = resp;
-
-      // أخطاء TOP غالبًا تحت error_response
-      const err = resp?.error_response;
-      if (!err) return resp;
-
-      // لو المشكلة appkey-not-exists على بوابة معينة: انتقل للبوابة التالية مباشرة
-      const sub = err?.sub_code || "";
-      if (String(sub).includes("appkey-not-exists")) {
-        console.log(`API ERROR appkey-not-exists on gw=${gw} -> switch gateway`);
-        break;
-      }
-
-      // لو مشكلة توقيع: جرّب attempt التالي
-      console.log(`API ERROR -> ${err?.code} ${err?.msg} sub=${sub || "-"}`);
-    }
-  }
-
-  return lastResp || { error: "No response" };
+  return data;
 }
 
-async function getTop4ByOrders(keyword) {
-  // 1) استعلام منتجات
-  const resp = await callAffiliate("aliexpress.affiliate.product.query", {
-    keywords: keyword,
-    page_no: 1,
-    page_size: 50,
-    // إعدادات لغة/عملة حسب احتياجك (قد لا تُطبق في كل الحالات)
-    target_language: "AR",
-    target_currency: "ILS",
-    // بعض الحسابات تحتاج tracking_id حتى في query
-    tracking_id: AE_TRACKING_ID || "",
+function extractProducts(resp) {
+  const root =
+    resp?.aliexpress_affiliate_product_query_response ||
+    resp?.aliexpress_affiliate_product_query_resp ||
+    resp;
+
+  const products =
+    root?.resp_result?.result?.products?.product ||
+    root?.resp_result?.result?.products ||
+    root?.result?.products?.product ||
+    root?.result?.products ||
+    [];
+
+  return Array.isArray(products) ? products : [];
+}
+
+function normalizeProducts(products) {
+  return products
+    .map((p) => {
+      const title = p?.product_title || "بدون عنوان";
+
+      const image = p?.product_main_image_url || "";
+      const detailUrl = p?.product_detail_url || "";
+
+      const priceVal =
+        p?.app_sale_price || p?.sale_price || p?.original_price || "";
+      const currency =
+        p?.app_sale_price_currency || p?.sale_price_currency || "USD";
+
+      const orders = Number(p?.lastest_volume || p?.volume || 0) || 0;
+      const rating = p?.evaluate_rate || "—";
+
+      return { title, image, detailUrl, priceVal, currency, orders, rating };
+    })
+    .filter((x) => x.image && x.detailUrl)
+    .sort((a, b) => b.orders - a.orders);
+}
+
+function formatPrice(p) {
+  // إذا USD_TO_ILS_RATE موجود، اعرض ₪
+  if (String(p.currency).toUpperCase() === "USD") {
+    const ils = usdToIls(p.priceVal);
+    if (ils !== null) return `₪${ils.toFixed(2)} (USD ${p.priceVal})`;
+  }
+  return `${p.currency} ${p.priceVal}`;
+}
+
+/* =========================
+   Collage
+========================= */
+function numberBadgeSVG(num) {
+  return `
+  <svg width="120" height="120">
+    <circle cx="60" cy="60" r="52" fill="#ff5a2a"/>
+    <text x="60" y="78" font-size="64" text-anchor="middle"
+          fill="#ffffff" font-family="Arial" font-weight="700">${num}</text>
+  </svg>`;
+}
+
+async function fetchImageBuffer(url) {
+  const res = await axios.get(url, { responseType: "arraybuffer", timeout: 25000 });
+  return Buffer.from(res.data);
+}
+
+async function buildCollage(items) {
+  const SIZE = 1000;
+  const HALF = SIZE / 2;
+
+  const base = sharp({
+    create: {
+      width: SIZE,
+      height: SIZE,
+      channels: 3,
+      background: { r: 255, g: 255, b: 255 },
+    },
   });
 
-  const raw = pickProductsFromResponse(resp);
-  const norm = raw.map(normalizeProduct).filter((p) => p.detailUrl);
+  const layers = [];
 
-  console.log(`rawProducts: ${raw.length} normalized: ${norm.length}`);
+  for (let i = 0; i < 4; i++) {
+    const buf = await fetchImageBuffer(items[i].image);
+    const img = await sharp(buf).resize(HALF, HALF, { fit: "cover" }).toBuffer();
 
-  // فلترة أعلى مبيعات
-  const sorted = norm
-    .filter((p) => p.img) // بدنا صورة للكولاج لاحقًا
-    .sort((a, b) => (b.orders || 0) - (a.orders || 0));
+    const left = (i % 2) * HALF;
+    const top = i < 2 ? 0 : HALF;
 
-  return sorted.slice(0, 4);
+    layers.push({ input: img, left, top });
+    layers.push({
+      input: Buffer.from(numberBadgeSVG(i + 1)),
+      left: left + 20,
+      top: top + 20,
+    });
+  }
+
+  layers.push({
+    input: Buffer.from(`
+      <svg width="${SIZE}" height="${SIZE}">
+        <rect x="${HALF - 2}" y="0" width="4" height="${SIZE}" fill="#ffffff" opacity="0.95"/>
+        <rect x="0" y="${HALF - 2}" width="${SIZE}" height="4" fill="#ffffff" opacity="0.95"/>
+      </svg>
+    `),
+    left: 0,
+    top: 0,
+  });
+
+  return base.composite(layers).jpeg({ quality: 85 }).toBuffer();
 }
 
-async function safeAffiliateLink(detailUrl) {
-  try {
-    if (!detailUrl) return "";
-    if (!AE_TRACKING_ID) return detailUrl;
+/* =========================
+   Telegram handlers
+========================= */
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+    "أهلًا 👋\nاكتب مثلًا:\nابحث عن ساعة ذكية\nابحث عن شاحن 65W"
+  );
+});
 
-    const resp = await callAffiliate("aliexpress.affiliate.link.generate", {
-      promotion_link_type: 0,
-      source_values: detailUrl,
-      tracking_id: AE_TRACKING_ID,
+function parseQuery(text) {
+  return text.replace(/^\s*ابحث(\s+لي)?\s+عن\s+/i, "").trim();
+}
+
+bot.on("message", async (msg) => {
+  const chatId = msg.chat.id;
+  const text = (msg.text || "").trim();
+  if (!text || text.startsWith("/")) return;
+
+  const query = parseQuery(text);
+  if (!query) return;
+
+  try {
+    bot.sendChatAction(chatId, "upload_photo");
+
+    const resp = await callAffiliate("aliexpress.affiliate.product.query", {
+      keywords: query,
+      page_no: 1,
+      page_size: 50,
+      sort: "LAST_VOLUME_DESC",
+      target_language: "AR",
+      target_currency: "USD",
+      tracking_id: TRACKING_ID,
     });
 
-    // أشكال مختلفة للرد
-    const link =
-      resp?.aliexpress_affiliate_link_generate_response?.resp_result?.result?.promotion_links?.promotion_link?.[0]?.promotion_link ||
-      resp?.aliexpress_affiliate_link_generate_response?.resp_result?.result?.promotion_links?.promotion_link?.promotion_link ||
-      resp?.result?.promotion_links?.promotion_link?.[0]?.promotion_link ||
-      "";
+    const raw = extractProducts(resp);
+    const all = normalizeProducts(raw);
 
-    return link || detailUrl;
-  } catch {
-    return detailUrl;
+    console.log(`rawProducts: ${raw.length} normalized: ${all.length}`);
+
+    if (all.length < 4) {
+      return bot.sendMessage(chatId, "ما لقيت نتائج كافية. جرّب كلمة ثانية 🙂");
+    }
+
+    const top4 = all.slice(0, 4);
+
+    const collage = await buildCollage(top4);
+
+    let caption = `🔥 أفضل 4 منتجات (الأكثر طلبًا) لبحث: ${query}\n\n`;
+    top4.forEach((p, i) => {
+      caption += `${i + 1}️⃣ ${p.title}\n`;
+      caption += `💰 السعر: ${formatPrice(p)}\n`;
+      caption += `🛒 المبيعات: ${p.orders}\n`;
+      caption += `⭐ التقييم: ${p.rating}\n`;
+      caption += `🔗 الرابط: ${p.detailUrl}\n\n`;
+    });
+
+    await bot.sendPhoto(chatId, collage, { caption });
+  } catch (e) {
+    console.error("BOT ERROR:", e?.response?.data || e?.message);
+    bot.sendMessage(chatId, "صار خطأ. افتح Logs وابعتلي سطر API ERROR إذا ظهر.");
   }
-}
+});
