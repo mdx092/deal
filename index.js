@@ -8,32 +8,33 @@ const TelegramBot = require("node-telegram-bot-api");
 
 /* =========================
    ENV
-   ========================= */
+========================= */
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 
-const PUBLIC_URL = process.env.PUBLIC_URL; // مثال: https://deal-jsyn.onrender.com
-if (!PUBLIC_URL) throw new Error("Missing PUBLIC_URL");
+// Render usually provides this, but keep PUBLIC_URL supported
+const PUBLIC_URL = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL;
+if (!PUBLIC_URL) throw new Error("Missing PUBLIC_URL (or RENDER_EXTERNAL_URL)");
 
 const AE_APP_KEY = process.env.AE_APP_KEY;
 const AE_APP_SECRET = process.env.AE_APP_SECRET;
-const TRACKING_ID = process.env.TRACKING_ID;
+const TRACKING_ID = process.env.TRACKING_ID; // AliExpress Affiliate Tracking ID
 
 if (!AE_APP_KEY || !AE_APP_SECRET) throw new Error("Missing AE_APP_KEY or AE_APP_SECRET");
 if (!TRACKING_ID) throw new Error("Missing TRACKING_ID");
 
 const DEBUG = String(process.env.DEBUG || "").trim() === "1";
 
-// تحويل عملات اختياري (ضعها في Render Env)
-const CNY_TO_ILS_RATE = Number(process.env.CNY_TO_ILS_RATE || "0"); // مثال 0.52
-const USD_TO_ILS_RATE = Number(process.env.USD_TO_ILS_RATE || "0"); // مثال 3.7
+// Optional currency rates (set in Render Env)
+const CNY_TO_ILS_RATE = Number(process.env.CNY_TO_ILS_RATE || "0"); // example 0.52
+const USD_TO_ILS_RATE = Number(process.env.USD_TO_ILS_RATE || "0"); // example 3.7
 
 /* =========================
-   Telegram: Webhook mode
-   ========================= */
-const bot = new TelegramBot(token); // no polling
+   Telegram webhook server
+========================= */
+const bot = new TelegramBot(token); // webhook mode (no polling)
 const WEBHOOK_PATH = `/bot${token}`;
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 10000);
 
 bot.setWebHook(`${PUBLIC_URL}${WEBHOOK_PATH}`);
 console.log("Webhook set ✅");
@@ -70,8 +71,8 @@ http
   .listen(PORT, () => console.log("Server listening on", PORT));
 
 /* =========================
-   Helpers (sign + log)
-   ========================= */
+   TOP helpers
+========================= */
 function topTimestamp() {
   const d = new Date();
   const p = (n) => String(n).padStart(2, "0");
@@ -97,7 +98,7 @@ function sanitizeForLog(obj) {
     .replace(/"sign"\s*:\s*"[^"]+"/g, '"sign":"***"')
     .replace(/"app_key"\s*:\s*"[^"]+"/g, '"app_key":"***"')
     .replace(/"token"\s*:\s*"[^"]+"/g, '"token":"***"')
-    .slice(0, 1600);
+    .slice(0, 1800);
 }
 
 async function topPost(gateway, method, bizParams) {
@@ -110,7 +111,6 @@ async function topPost(gateway, method, bizParams) {
     sign_method: "md5",
     ...bizParams,
   };
-
   params.sign = signTopMd5(params, AE_APP_SECRET);
 
   const res = await axios.post(gateway, new URLSearchParams(params), {
@@ -123,7 +123,7 @@ async function topPost(gateway, method, bizParams) {
 
 /* =========================
    Gateways fallback
-   ========================= */
+========================= */
 function buildGatewayList() {
   const envGw = (process.env.AE_GATEWAY || "").trim();
   const list = [
@@ -143,8 +143,8 @@ function gwLabel(gw) {
 }
 
 /* =========================
-   Extract response
-   ========================= */
+   Response extract
+========================= */
 function extractProducts(apiData) {
   const root =
     apiData?.aliexpress_affiliate_product_query_response ||
@@ -169,7 +169,6 @@ function getApiErrorSummary(apiData) {
     root?.resp_result?.error_response ||
     root?.resp_result?.errorResponse ||
     null;
-
   if (err) return err;
 
   const msg =
@@ -185,122 +184,33 @@ function getApiErrorSummary(apiData) {
 }
 
 /* =========================
-   Text: short + clean + 2 lines (for collage)
-   ========================= */
-function cleanTitle(title, maxLen = 46) {
-  if (!title) return "منتج";
-  let t = String(title);
-
-  // إزالة رموز وحشو شائع
-  t = t
-    .replace(/[™®©]/g, "")
-    .replace(/\s+/g, " ")
-    .replace(/\b(Hot|New|Best|Sale|Original|202\d|Free\s*Shipping|Shipping|Discount|Top)\b/gi, "")
-    .replace(/\b(For|With|And|Or|The|A|An)\b/gi, "")
-    .replace(/\b(حار|جديد|الأفضل|تخفيض|عرض|أصلي|شحن\s*مجاني|توصيل|خصم)\b/gi, "")
-    .trim();
-
-  // قص نهائي
-  if (t.length > maxLen) t = t.slice(0, maxLen - 1).trim() + "…";
-  return t || "منتج";
-}
-
-function wrapTwoLines(text, maxCharsPerLine = 22) {
-  const words = String(text || "").split(/\s+/).filter(Boolean);
-  const lines = [];
-  let cur = "";
-
-  for (const w of words) {
-    const next = cur ? `${cur} ${w}` : w;
-    if (next.length <= maxCharsPerLine) {
-      cur = next;
-    } else {
-      if (cur) lines.push(cur);
-      cur = w;
-      if (lines.length === 2) break;
-    }
-  }
-  if (cur && lines.length < 2) lines.push(cur);
-
-  // لو كلمة واحدة طويلة جدًا
-  if (lines.length === 0 && text) lines.push(String(text).slice(0, maxCharsPerLine));
-
-  // قص كل سطر إذا لزم
-  return lines.map((l) => (l.length > maxCharsPerLine ? l.slice(0, maxCharsPerLine - 1) + "…" : l));
-}
-
-function escapeXml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
+   Keyword helper (optional)
+========================= */
+function arabicToEnglishHint(q) {
+  const s = q.trim().toLowerCase();
+  const map = [
+    [/شاحن\s*65w/g, "65w charger"],
+    [/65\s*واط/g, "65w"],
+    [/100\s*واط/g, "100w"],
+    [/شاحن/g, "charger"],
+    [/كابل/g, "cable"],
+    [/باور\s*بانك/g, "power bank"],
+    [/بنك\s*طاقة/g, "power bank"],
+    [/ساعة\s*ذكية/g, "smartwatch"],
+    [/ساعة/g, "watch"],
+    [/سماعات/g, "earbuds"],
+    [/بلوتوث/g, "bluetooth"],
+    [/لاسلكي/g, "wireless"],
+  ];
+  let out = s;
+  for (const [re, rep] of map) out = out.replace(re, rep);
+  if (out === s) return null;
+  return out;
 }
 
 /* =========================
-   Currency + rating helpers
-   ========================= */
-function numFromAny(x) {
-  if (x === null || x === undefined) return null;
-  const m = String(x).match(/(\d+(\.\d+)?)/);
-  return m ? Number(m[1]) : null;
-}
-
-function priceToILS(priceNum, currency) {
-  if (!Number.isFinite(priceNum)) return null;
-  const cur = String(currency || "").toUpperCase();
-
-  if (cur === "ILS") return priceNum;
-  if (cur === "CNY" && CNY_TO_ILS_RATE > 0) return priceNum * CNY_TO_ILS_RATE;
-  if (cur === "USD" && USD_TO_ILS_RATE > 0) return priceNum * USD_TO_ILS_RATE;
-
-  return null;
-}
-
-function formatPriceILS(priceNum, currency) {
-  const ils = priceToILS(priceNum, currency);
-  if (ils !== null) return `₪${ils.toFixed(2)}`;
-  if (priceNum === null || priceNum === undefined) return "—";
-  return `${currency || ""} ${priceNum}`;
-}
-
-function ratingTo5(raw) {
-  const n = numFromAny(raw);
-  if (!Number.isFinite(n)) return null;
-
-  // نسبة 0-100 => حولها لـ 0-5
-  if (n > 5 && n <= 100) return Math.round((n / 20) * 10) / 10;
-
-  // بالفعل 0-5
-  if (n >= 0 && n <= 5) return Math.round(n * 10) / 10;
-
-  return null;
-}
-
-/* =========================
-   Relevance (simple)
-   ========================= */
-function relevanceScore(query, title) {
-  const q = String(query || "")
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .split(/\s+/)
-    .filter((w) => w.length >= 2);
-
-  const t = String(title || "").toLowerCase();
-
-  let score = 0;
-  for (const w of new Set(q)) {
-    if (t.includes(w)) score += 2;
-  }
-  if (q.length && t.includes(q[0])) score += 3;
-  return score;
-}
-
-/* =========================
-   AliExpress: Query with fallback
-   ========================= */
+   Query with fallback
+========================= */
 async function affiliateProductQueryWithFallback(keyword) {
   const gateways = buildGatewayList();
 
@@ -321,6 +231,12 @@ async function affiliateProductQueryWithFallback(keyword) {
   const attempts = [];
   attempts.push({ kw: keyword, withFields: true });
   attempts.push({ kw: keyword, withFields: false });
+
+  const en = arabicToEnglishHint(keyword);
+  if (en) {
+    attempts.push({ kw: en, withFields: true });
+    attempts.push({ kw: en, withFields: false });
+  }
 
   let lastInfo = null;
 
@@ -371,14 +287,92 @@ async function affiliateProductQueryWithFallback(keyword) {
 }
 
 /* =========================
-   Normalize products (adds shortTitle + 2 lines)
-   ========================= */
+   Title shortener
+========================= */
+function cleanTitle(title, maxLen = 60) {
+  if (!title) return "منتج";
+  let t = String(title);
+
+  t = t
+    .replace(/[™®©]/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/\b(Hot|New|Best|Sale|Original|202\d|Free\s*Shipping|Shipping|Discount|Top)\b/gi, "")
+    .replace(/\b(For|With|And|Or|The|A|An)\b/gi, "")
+    .replace(/\b(حار|جديد|الأفضل|تخفيض|عرض|أصلي|شحن\s*مجاني|توصيل|خصم)\b/gi, "")
+    .trim();
+
+  if (t.length > maxLen) t = t.slice(0, maxLen - 1).trim() + "…";
+  return t || "منتج";
+}
+
+/* =========================
+   Currency + rating
+========================= */
+function numFromAny(x) {
+  if (x === null || x === undefined) return null;
+  const m = String(x).match(/(\d+(\.\d+)?)/);
+  return m ? Number(m[1]) : null;
+}
+
+function priceToILS(priceNum, currency) {
+  if (!Number.isFinite(priceNum)) return null;
+  const cur = String(currency || "").toUpperCase();
+
+  if (cur === "ILS") return priceNum;
+  if (cur === "CNY" && CNY_TO_ILS_RATE > 0) return priceNum * CNY_TO_ILS_RATE;
+  if (cur === "USD" && USD_TO_ILS_RATE > 0) return priceNum * USD_TO_ILS_RATE;
+
+  return null;
+}
+
+function formatPriceILS(priceNum, currency) {
+  const ils = priceToILS(priceNum, currency);
+  if (ils !== null) return `₪${ils.toFixed(2)}`;
+  if (priceNum === null || priceNum === undefined) return "—";
+  return `${currency || ""} ${priceNum}`;
+}
+
+function ratingTo5(raw) {
+  const n = numFromAny(raw);
+  if (!Number.isFinite(n)) return null;
+
+  // if percent 0..100
+  if (n > 5 && n <= 100) return Math.round((n / 20) * 10) / 10;
+
+  // already 0..5
+  if (n >= 0 && n <= 5) return Math.round(n * 10) / 10;
+
+  return null;
+}
+
+/* =========================
+   Relevance score (simple)
+========================= */
+function relevanceScore(query, title) {
+  const q = String(query || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 2);
+
+  const t = String(title || "").toLowerCase();
+
+  let score = 0;
+  for (const w of new Set(q)) {
+    if (t.includes(w)) score += 2;
+  }
+  if (q.length && t.includes(q[0])) score += 3;
+  return score;
+}
+
+/* =========================
+   Normalize products
+========================= */
 function normalizeProducts(rawProducts, query) {
   return rawProducts
     .map((p) => {
       const title = p?.product_title || p?.title || "منتج";
-      const shortTitle = cleanTitle(title, 46);
-      const titleLines = wrapTwoLines(shortTitle, 22);
+      const shortTitle = cleanTitle(title, 60);
 
       const image =
         p?.product_main_image_url ||
@@ -406,7 +400,6 @@ function normalizeProducts(rawProducts, query) {
         p?.original_price_currency ||
         p?.target_app_sale_price_currency ||
         p?.target_sale_price_currency ||
-        // fallback بسيط
         (String(priceRaw).includes("US") ? "USD" : "CNY");
 
       const orders = Number(p?.lastest_volume ?? p?.last_volume ?? p?.volume ?? p?.sales_count ?? 0) || 0;
@@ -419,7 +412,6 @@ function normalizeProducts(rawProducts, query) {
       return {
         title,
         shortTitle,
-        titleLines,
         image,
         detailUrl,
         priceNum,
@@ -434,8 +426,8 @@ function normalizeProducts(rawProducts, query) {
 }
 
 /* =========================
-   Link Generate (affiliate) - optional
-   ========================= */
+   Affiliate link generate
+========================= */
 async function affiliateLinkGenerate(sourceUrls) {
   const gateways = buildGatewayList();
   for (const gateway of gateways) {
@@ -469,41 +461,15 @@ function extractPromotionLinks(apiData) {
 }
 
 /* =========================
-   Collage (2x2) + TITLE OVERLAY
-   ========================= */
+   Collage 2x2 (NO TEXT) + smaller numbers
+========================= */
 function numberBadgeSVG(num) {
+  // أصغر من قبل
   return `
-  <svg width="120" height="120">
-    <circle cx="60" cy="60" r="52" fill="#ff5a2a"/>
-    <text x="60" y="78" font-size="64" text-anchor="middle"
-          fill="#ffffff" font-family="Arial" font-weight="700">${num}</text>
-  </svg>`;
-}
-
-function titleBarSVG(lines, w, h) {
-  const l1 = escapeXml(lines?.[0] || "");
-  const l2 = escapeXml(lines?.[1] || "");
-
-  // RTL friendly
-  return `
-  <svg width="${w}" height="${h}">
-    <rect x="0" y="0" width="${w}" height="${h}" fill="#000000" opacity="0.55"/>
-    <text x="${w / 2}" y="${Math.round(h * 0.42)}"
-          font-size="${Math.round(h * 0.32)}"
-          text-anchor="middle"
-          fill="#ffffff"
-          font-family="Arial"
-          direction="rtl"
-          unicode-bidi="plaintext"
-          font-weight="700">${l1}</text>
-    <text x="${w / 2}" y="${Math.round(h * 0.80)}"
-          font-size="${Math.round(h * 0.30)}"
-          text-anchor="middle"
-          fill="#ffffff"
-          font-family="Arial"
-          direction="rtl"
-          unicode-bidi="plaintext"
-          font-weight="700">${l2}</text>
+  <svg width="90" height="90">
+    <circle cx="45" cy="45" r="38" fill="#ff5a2a"/>
+    <text x="45" y="60" font-size="46" text-anchor="middle"
+          fill="#ffffff" font-family="Arial" font-weight="800">${num}</text>
   </svg>`;
 }
 
@@ -515,7 +481,6 @@ async function fetchImageBuffer(url) {
 async function buildCollage(items) {
   const SIZE = 1000;
   const HALF = SIZE / 2;
-  const BAR_H = 140; // ارتفاع شريط العنوان لكل مربع
 
   const base = sharp({
     create: {
@@ -534,26 +499,21 @@ async function buildCollage(items) {
 
     const buf = await fetchImageBuffer(items[i].image);
 
-    // جزء الصورة (بدون شريط العنوان)
     const img = await sharp(buf)
-      .resize(HALF, HALF - BAR_H, { fit: "cover" })
+      .resize(HALF, HALF, { fit: "cover" })
       .toBuffer();
 
     layers.push({ input: img, left, top });
 
-    // شريط العنوان أسفل كل مربع
-    const bar = Buffer.from(titleBarSVG(items[i].titleLines, HALF, BAR_H));
-    layers.push({ input: bar, left, top: top + (HALF - BAR_H) });
-
-    // رقم المنتج
+    // رقم أصغر + مكانه شوي أقرب
     layers.push({
       input: Buffer.from(numberBadgeSVG(i + 1)),
-      left: left + 20,
-      top: top + 20,
+      left: left + 14,
+      top: top + 14,
     });
   }
 
-  // فواصل بسيطة
+  // خطوط فصل خفيفة
   layers.push({
     input: Buffer.from(`
       <svg width="${SIZE}" height="${SIZE}">
@@ -569,8 +529,8 @@ async function buildCollage(items) {
 }
 
 /* =========================
-   Caption
-   ========================= */
+   Caption builder
+========================= */
 function buildCaption(query, items) {
   let msg = `🔥 أفضل 4 منتجات (الأكثر طلبًا)\n`;
   msg += `🔎 البحث: ${query}\n\n`;
@@ -592,7 +552,7 @@ function buildCaption(query, items) {
 
 /* =========================
    Telegram handlers
-   ========================= */
+========================= */
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
@@ -601,7 +561,13 @@ bot.onText(/\/start/, (msg) => {
 });
 
 function parseQuery(text) {
-  return text.replace(/^\s*ابحث(\s+لي)?\s+عن\s+/i, "").trim();
+  const t = (text || "").trim();
+  // supports: ابحث عن / ابحث لي عن / ابحث
+  const cleaned = t
+    .replace(/^\s*ابحث(\s+لي)?\s+عن\s+/i, "")
+    .replace(/^\s*ابحث\s+/i, "")
+    .trim();
+  return cleaned || t;
 }
 
 bot.on("message", async (msg) => {
@@ -617,15 +583,16 @@ bot.on("message", async (msg) => {
 
     const { products: rawProducts, gateway } = await affiliateProductQueryWithFallback(query);
 
-    // Normalize + relevance filter
     const normAll = normalizeProducts(rawProducts, query);
 
-    // فلترة: نفضّل المرتبط بالطلب + أعلى مبيعات
+    // فلترة صلة (لو ما كفت، نخفف)
     let candidates = normAll.filter((p) => p.rel >= 2);
-    if (candidates.length < 4) candidates = normAll; // لو ما كفا، نخفف الفلتر
+    if (candidates.length < 4) candidates = normAll;
 
+    // ترتيب: صلة ثم مبيعات
     candidates.sort((a, b) => (b.rel - a.rel) || (b.orders - a.orders));
 
+    // خذ 4
     const top4 = candidates.slice(0, 4);
 
     console.log(
@@ -636,7 +603,7 @@ bot.on("message", async (msg) => {
       return bot.sendMessage(chatId, "ما لقيت 4 نتائج مناسبة. جرّب كلمة ثانية 🙂");
     }
 
-    // Affiliate links (اختياري)
+    // Affiliate links
     const urls = top4.map((p) => p.detailUrl).filter(Boolean);
     if (urls.length) {
       const linkData = await affiliateLinkGenerate(urls);
