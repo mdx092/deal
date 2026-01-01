@@ -32,7 +32,7 @@ const PORT = process.env.PORT || 3000;
 
 // Set webhook
 bot.setWebHook(`${PUBLIC_URL}${WEBHOOK_PATH}`);
-console.log("Webhook set to:", `${PUBLIC_URL}${WEBHOOK_PATH}`);
+console.log("Webhook set ✅");
 
 // HTTP server: health + webhook receiver
 http
