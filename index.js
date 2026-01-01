@@ -4,25 +4,47 @@ const crypto = require("crypto");
 const TelegramBot = require("node-telegram-bot-api");
 const sharp = require("sharp");
 
-// -------- Telegram --------
+/* =========================================================
+   Render Health Server (Required for Web Service Port Binding)
+   ========================================================= */
+const http = require("http");
+const PORT = process.env.PORT || 3000;
+
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("OK");
+  })
+  .listen(PORT, () => console.log("Health server listening on", PORT));
+
+/* =========================================================
+   Telegram
+   ========================================================= */
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 const bot = new TelegramBot(token, { polling: true });
 
-// -------- TOP / AliExpress Official API helpers --------
+/* =========================================================
+   TOP / AliExpress Official Affiliate API helpers
+   method: aliexpress.affiliate.product.query
+   ========================================================= */
 function topTimestamp() {
   const d = new Date();
   const p = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(
+    d.getHours()
+  )}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
 function signTop(params, secret) {
   const keys = Object.keys(params).sort();
   let base = secret;
+
   for (const k of keys) {
     const v = params[k];
     if (v !== undefined && v !== null && v !== "") base += `${k}${v}`;
   }
+
   base += secret;
   return crypto.createHash("md5").update(base, "utf8").digest("hex").toUpperCase();
 }
@@ -44,10 +66,10 @@ async function affiliateProductQuery(keyword) {
 
     keywords: keyword,
     page_no: 1,
-    page_size: 50,            // نجلب أكثر ثم نفلتر أعلى مبيعات
+    page_size: 50, // نجلب أكثر ثم نفلتر أعلى مبيعات
 
     target_language: "AR",
-    target_currency: "ILS",   // ₪
+    target_currency: "ILS", // ₪
     ship_to_country: "IL",
 
     tracking_id: process.env.TRACKING_ID || "",
@@ -64,7 +86,6 @@ async function affiliateProductQuery(keyword) {
 }
 
 function extractProducts(apiData) {
-  // المسار الأكثر شيوعًا
   const root =
     apiData?.aliexpress_affiliate_product_query_response ||
     apiData?.aliexpress_affiliate_product_query_resp ||
@@ -82,7 +103,9 @@ function extractProducts(apiData) {
   return Array.isArray(products) ? products : [];
 }
 
-// -------- Orders parsing + normalize --------
+/* =========================================================
+   Orders parsing + normalize
+   ========================================================= */
 function parseOrdersToNumber(v) {
   if (v === undefined || v === null) return 0;
 
@@ -121,7 +144,7 @@ function normalizeProducts(products) {
 
     const price = priceVal ? `₪${String(priceVal).replace(/[^\d.]/g, "")}` : "—";
 
-    // جرّب أكثر من حقل للمبيعات/الطلبات
+    // حاول أكثر من حقل للمبيعات/الطلبات
     const ordersRaw =
       p?.sales_count ??
       p?.volume ??
@@ -133,12 +156,8 @@ function normalizeProducts(products) {
 
     const ordersNumber = parseOrdersToNumber(ordersRaw);
 
-    // التقييم (قد يختلف)
-    const rating =
-      p?.evaluate_rate ??
-      p?.avg_evaluate_rate ??
-      p?.rating ??
-      "—";
+    // التقييم (قد يختلف حسب الاستجابة)
+    const rating = p?.evaluate_rate ?? p?.avg_evaluate_rate ?? p?.rating ?? "—";
 
     const image =
       p?.product_main_image_url ||
@@ -168,7 +187,9 @@ function normalizeProducts(products) {
   });
 }
 
-// -------- Collage builder (2x2 + numbered badges) --------
+/* =========================================================
+   Collage builder (2x2 + numbered badges)
+   ========================================================= */
 function numberBadgeSVG(num) {
   return `
   <svg width="120" height="120">
@@ -200,7 +221,6 @@ async function buildCollage(items) {
 
   for (let i = 0; i < 4; i++) {
     const buf = await fetchImageBuffer(items[i].image);
-
     const img = await sharp(buf).resize(HALF, HALF, { fit: "cover" }).toBuffer();
 
     const left = (i % 2) * HALF;
@@ -215,7 +235,7 @@ async function buildCollage(items) {
     });
   }
 
-  // separators
+  // separators (white lines)
   layers.push({
     input: Buffer.from(`
       <svg width="${SIZE}" height="${SIZE}">
@@ -243,7 +263,9 @@ function buildArabicCaption(query, items) {
   return msg;
 }
 
-// -------- Telegram handlers --------
+/* =========================================================
+   Telegram handlers
+   ========================================================= */
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
@@ -266,8 +288,7 @@ bot.on("message", async (msg) => {
     const apiData = await affiliateProductQuery(query);
     const rawProducts = extractProducts(apiData);
 
-    let all = normalizeProducts(rawProducts)
-      .filter((p) => p.link && p.image);
+    let all = normalizeProducts(rawProducts).filter((p) => p.link && p.image);
 
     // sort by orders desc and take top 4
     all.sort((a, b) => b.ordersNumber - a.ordersNumber);
