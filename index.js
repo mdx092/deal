@@ -1,31 +1,71 @@
 require("dotenv").config();
+
 const axios = require("axios");
 const crypto = require("crypto");
-const TelegramBot = require("node-telegram-bot-api");
 const sharp = require("sharp");
 const http = require("http");
+const TelegramBot = require("node-telegram-bot-api");
 
-/* =========================
-   Render Health Server
-   ========================= */
-const PORT = process.env.PORT || 3000;
-http
-  .createServer((req, res) => {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("OK");
-  })
-  .listen(PORT, () => console.log("Health server listening on", PORT));
-
-/* =========================
-   Telegram
-   ========================= */
+/* =========================================================
+   ENV
+   ========================================================= */
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
-const bot = new TelegramBot(token, { polling: true });
 
-/* =========================
-   TOP helpers
-   ========================= */
+const PUBLIC_URL = process.env.PUBLIC_URL; // مثل: https://deal-jsyn.onrender.com
+if (!PUBLIC_URL) throw new Error("Missing PUBLIC_URL");
+
+const AE_GATEWAY = process.env.AE_GATEWAY || "https://api.taobao.com/router/rest";
+const AE_APP_KEY = process.env.AE_APP_KEY;
+const AE_APP_SECRET = process.env.AE_APP_SECRET;
+const TRACKING_ID = process.env.TRACKING_ID;
+
+if (!AE_APP_KEY || !AE_APP_SECRET) throw new Error("Missing AE_APP_KEY or AE_APP_SECRET");
+if (!TRACKING_ID) throw new Error("Missing TRACKING_ID (required for affiliate links)");
+
+/* =========================================================
+   Telegram: Webhook mode (no polling)
+   ========================================================= */
+const bot = new TelegramBot(token); // ✅ no polling
+const WEBHOOK_PATH = `/bot${token}`;
+const PORT = process.env.PORT || 3000;
+
+// Set webhook
+bot.setWebHook(`${PUBLIC_URL}${WEBHOOK_PATH}`);
+console.log("Webhook set to:", `${PUBLIC_URL}${WEBHOOK_PATH}`);
+
+// HTTP server: health + webhook receiver
+http
+  .createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      return res.end("OK");
+    }
+
+    if (req.method === "POST" && req.url === WEBHOOK_PATH) {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        try {
+          const update = JSON.parse(body);
+          bot.processUpdate(update);
+        } catch (e) {
+          console.error("Bad JSON update:", e.message);
+        }
+        res.writeHead(200);
+        res.end("OK");
+      });
+      return;
+    }
+
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not found");
+  })
+  .listen(PORT, () => console.log("Server listening on", PORT));
+
+/* =========================================================
+   TOP / AliExpress Official API helpers
+   ========================================================= */
 function topTimestamp() {
   const d = new Date();
   const p = (n) => String(n).padStart(2, "0");
@@ -46,15 +86,9 @@ function signTopMd5(params, secret) {
 }
 
 async function topPost(method, bizParams) {
-  const gateway = process.env.AE_GATEWAY || "https://eco.taobao.com/router/rest";
-  const appKey = process.env.AE_APP_KEY;
-  const secret = process.env.AE_APP_SECRET;
-
-  if (!appKey || !secret) throw new Error("Missing AE_APP_KEY or AE_APP_SECRET");
-
   const params = {
     method,
-    app_key: appKey,
+    app_key: AE_APP_KEY,
     timestamp: topTimestamp(),
     format: "json",
     v: "2.0",
@@ -62,9 +96,9 @@ async function topPost(method, bizParams) {
     ...bizParams,
   };
 
-  params.sign = signTopMd5(params, secret);
+  params.sign = signTopMd5(params, AE_APP_SECRET);
 
-  const res = await axios.post(gateway, new URLSearchParams(params), {
+  const res = await axios.post(AE_GATEWAY, new URLSearchParams(params), {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     timeout: 25000,
   });
@@ -72,21 +106,20 @@ async function topPost(method, bizParams) {
   return res.data;
 }
 
-/* =========================
-   AliExpress: product query
-   ========================= */
+/* =========================================================
+   AliExpress Affiliate: Product Query
+   - We request many, sorted by volume (highest sales)
+   ========================================================= */
 async function affiliateProductQuery(keyword) {
-  // sort=LAST_VOLUME_DESC مدعوم رسميًا لفرز أعلى مبيعات :contentReference[oaicite:3]{index=3}
   return topPost("aliexpress.affiliate.product.query", {
     keywords: keyword,
     page_no: 1,
     page_size: 50,
     sort: "LAST_VOLUME_DESC",
     target_language: "AR",
-    target_currency: "USD", // ILS غير موجودة في القائمة الرسمية :contentReference[oaicite:4]{index=4}
+    target_currency: "USD",
     ship_to_country: "IL",
-    // tracking_id هنا اختياري، لكن مهم جدًا في link.generate
-    tracking_id: process.env.TRACKING_ID || "",
+    tracking_id: TRACKING_ID,
   });
 }
 
@@ -109,15 +142,10 @@ function extractProducts(apiData) {
 function normalizeProducts(products) {
   return products.map((p) => {
     const title = p?.product_title || "بدون عنوان";
-
     const priceVal = p?.app_sale_price || p?.sale_price || p?.original_price || "";
     const currency = p?.app_sale_price_currency || p?.sale_price_currency || "USD";
-
-    // أعلى مبيعات: lastest_volume (هكذا مكتوبة في الدوك) :contentReference[oaicite:5]{index=5}
-    const ordersNumber = Number(p?.lastest_volume || 0) || 0;
-
-    const rating = p?.evaluate_rate || "—"; // مثال 92.1% :contentReference[oaicite:6]{index=6}
-
+    const ordersNumber = Number(p?.lastest_volume || 0) || 0; // sales volume
+    const rating = p?.evaluate_rate || "—"; // often percent
     const image = p?.product_main_image_url || "";
     const detailUrl = p?.product_detail_url || "";
 
@@ -129,23 +157,19 @@ function normalizeProducts(products) {
       rating: String(rating),
       image,
       detailUrl,
-      affiliateLink: "", // سنملأه من link.generate
+      affiliateLink: "",
     };
   });
 }
 
-/* =========================
-   AliExpress: link generate
-   ========================= */
+/* =========================================================
+   AliExpress Affiliate: Link Generate (affiliate links)
+   ========================================================= */
 async function affiliateLinkGenerate(sourceUrls) {
-  const trackingId = process.env.TRACKING_ID;
-  if (!trackingId) throw new Error("Missing TRACKING_ID (required for affiliate links)");
-
-  // tracking_id + source_values + promotion_link_type إلزامية :contentReference[oaicite:7]{index=7}
   return topPost("aliexpress.affiliate.link.generate", {
     promotion_link_type: 0,
     source_values: sourceUrls.join(","),
-    tracking_id: trackingId,
+    tracking_id: TRACKING_ID,
   });
 }
 
@@ -163,9 +187,9 @@ function extractPromotionLinks(apiData) {
   return Array.isArray(arr) ? arr : [];
 }
 
-/* =========================
-   Collage
-   ========================= */
+/* =========================================================
+   Collage (2x2) + numbered badges
+   ========================================================= */
 function numberBadgeSVG(num) {
   return `
   <svg width="120" height="120">
@@ -210,6 +234,7 @@ async function buildCollage(items) {
     });
   }
 
+  // separators
   layers.push({
     input: Buffer.from(`
       <svg width="${SIZE}" height="${SIZE}">
@@ -234,12 +259,13 @@ function buildCaption(query, items) {
     msg += `⭐ التقييم: ${p.rating}\n`;
     msg += `🔗 الرابط: ${link}\n\n`;
   });
+  msg += `🟠 اكتب: "ابحث عن ..."`;
   return msg;
 }
 
-/* =========================
+/* =========================================================
    Telegram handlers
-   ========================= */
+   ========================================================= */
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
@@ -263,25 +289,23 @@ bot.on("message", async (msg) => {
   try {
     bot.sendChatAction(chatId, "upload_photo");
 
-    // 1) منتجات (مرتبة أصلاً حسب LAST_VOLUME_DESC)
+    // 1) products sorted by sales
     const productData = await affiliateProductQuery(query);
     const rawProducts = extractProducts(productData);
     let all = normalizeProducts(rawProducts).filter((p) => p.image && p.detailUrl);
 
-    // خذ أول 4 (لأنها أصلاً أعلى مبيعات) + احتياط إذا نقصت
-    const topCandidates = all.slice(0, 10);
-    if (topCandidates.length < 4) {
+    if (all.length < 4) {
       return bot.sendMessage(chatId, "ما لقيت نتائج كافية. جرّب كلمة ثانية 🙂");
     }
 
-    // 2) توليد روابط أفلييت لأفضل 4
-    const top4 = topCandidates.slice(0, 4);
-    const urls = top4.map((p) => p.detailUrl);
+    // top 4 (already highest volume)
+    const top4 = all.slice(0, 4);
 
+    // 2) generate affiliate links
+    const urls = top4.map((p) => p.detailUrl);
     const linkData = await affiliateLinkGenerate(urls);
     const linksArr = extractPromotionLinks(linkData);
 
-    // map: source_value -> promotion_link
     const linkMap = new Map();
     for (const row of linksArr) {
       if (row?.source_value && row?.promotion_link) {
@@ -292,7 +316,7 @@ bot.on("message", async (msg) => {
       p.affiliateLink = linkMap.get(p.detailUrl) || "";
     });
 
-    // 3) كولاج + كابتشن
+    // 3) collage + caption
     const collage = await buildCollage(top4);
     const caption = buildCaption(query, top4);
 
@@ -301,9 +325,9 @@ bot.on("message", async (msg) => {
     console.error(err?.response?.data || err.message);
     bot.sendMessage(
       chatId,
-      "صار خطأ 😅\nتأكد أن TRACKING_ID موجود في Render Environment، ثم جرّب مرة ثانية."
+      "صار خطأ 😅\nتأكد أن PUBLIC_URL و TRACKING_ID موجودين في Render Environment، ثم جرّب مرة ثانية."
     );
   }
 });
 
-console.log("Deals48 bot running (polling)...");
+console.log("Deals48 bot running (webhook mode)...");
