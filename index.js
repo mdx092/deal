@@ -1,574 +1,413 @@
-require("dotenv").config();
+import "dotenv/config";
+import express from "express";
+import TelegramBot from "node-telegram-bot-api";
+import crypto from "crypto";
+import dayjs from "dayjs";
+import utc from "dayjs/plugin/utc.js";
+import timezone from "dayjs/plugin/timezone.js";
 
-const axios = require("axios");
-const crypto = require("crypto");
-const sharp = require("sharp");
-const http = require("http");
-const TelegramBot = require("node-telegram-bot-api");
+dayjs.extend(utc);
+dayjs.extend(timezone);
 
-/* =========================
-   ENV
-   ========================= */
-const token = process.env.TELEGRAM_BOT_TOKEN;
-if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
-
-const PUBLIC_URL = process.env.PUBLIC_URL; // مثال: https://deal-jsyn.onrender.com
-if (!PUBLIC_URL) throw new Error("Missing PUBLIC_URL");
-
+// =====================
+// ENV
+// =====================
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const AE_APP_KEY = process.env.AE_APP_KEY;
 const AE_APP_SECRET = process.env.AE_APP_SECRET;
-const TRACKING_ID = process.env.TRACKING_ID;
+const AE_TRACKING_ID = process.env.AE_TRACKING_ID; // Tracking ID من AliExpress Portals
+const AE_GATEWAY = process.env.AE_GATEWAY; // مهم! خليه https://api-sg.aliexpress.com/sync
 
-if (!AE_APP_KEY || !AE_APP_SECRET) throw new Error("Missing AE_APP_KEY or AE_APP_SECRET");
-if (!TRACKING_ID) throw new Error("Missing TRACKING_ID");
+if (!TELEGRAM_BOT_TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN");
+if (!AE_APP_KEY) console.warn("⚠️ Missing AE_APP_KEY");
+if (!AE_APP_SECRET) console.warn("⚠️ Missing AE_APP_SECRET");
+if (!AE_TRACKING_ID) console.warn("⚠️ Missing AE_TRACKING_ID (affiliate links may not work)");
 
-const DEBUG = String(process.env.DEBUG || "").trim() === "1";
+// Render يعطيك الرابط العام
+const PUBLIC_URL =
+  process.env.RENDER_EXTERNAL_URL ||
+  process.env.PUBLIC_URL ||
+  process.env.APP_URL ||
+  "";
 
-/**
- * تحويل USD -> ILS اختياري
- * ضع USD_TO_ILS_RATE في Render مثل: 3.7
- */
-const USD_TO_ILS_RATE = Number(process.env.USD_TO_ILS_RATE || "0"); // 0 = بدون تحويل
-function usdToIls(usdStr) {
-  const usd = Number(String(usdStr).replace(/[^\d.]/g, ""));
-  if (!Number.isFinite(usd) || usd <= 0) return null;
-  if (!USD_TO_ILS_RATE || USD_TO_ILS_RATE <= 0) return null;
-  return usd * USD_TO_ILS_RATE;
+const PORT = Number(process.env.PORT || 10000);
+
+// =====================
+// Express (Webhook server)
+// =====================
+const app = express();
+app.use(express.json());
+
+app.get("/", (_, res) => res.status(200).send("OK"));
+
+const WEBHOOK_PATH = `/bot${TELEGRAM_BOT_TOKEN}`;
+
+// =====================
+// Telegram Bot (webhook mode)
+// =====================
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
+
+if (!PUBLIC_URL) {
+  console.warn(
+    "⚠️ PUBLIC_URL not found. On Render set env RENDER_EXTERNAL_URL automatically. If webhook doesn't work, add PUBLIC_URL=https://your.onrender.com"
+  );
+} else {
+  const webhookUrl = `${PUBLIC_URL}${WEBHOOK_PATH}`;
+  bot
+    .setWebHook(webhookUrl)
+    .then(() => console.log("Webhook set ✅"))
+    .catch((e) => console.error("Webhook set error:", e?.message || e));
 }
 
-/* =========================
-   Telegram: Webhook mode
-   ========================= */
-const bot = new TelegramBot(token); // no polling
-const WEBHOOK_PATH = `/bot${token}`;
-const PORT = process.env.PORT || 3000;
-
-// Set webhook
-bot.setWebHook(`${PUBLIC_URL}${WEBHOOK_PATH}`);
-console.log("Webhook set ✅");
-
-// HTTP server: health + webhook receiver
-http
-  .createServer((req, res) => {
-    if (req.method === "GET" && req.url === "/") {
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      return res.end("OK");
-    }
-
-    if (req.method === "POST" && req.url === WEBHOOK_PATH) {
-      let body = "";
-      req.on("data", (chunk) => (body += chunk));
-      req.on("end", () => {
-        try {
-          const update = JSON.parse(body);
-          if (DEBUG) console.log("Incoming update ✅", update?.update_id);
-          bot.processUpdate(update);
-        } catch (e) {
-          console.error("Bad JSON update:", e.message);
-        }
-        res.writeHead(200);
-        res.end("OK");
-      });
-      return;
-    }
-
-    res.writeHead(404, { "Content-Type": "text/plain" });
-    res.end("Not found");
-  })
-  .listen(PORT, () => console.log("Server listening on", PORT));
-
-/* =========================
-   TOP helpers
-   ========================= */
-function topTimestamp() {
-  const d = new Date();
-  const p = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(
-    d.getHours()
-  )}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-}
-
-function signTopMd5(params, secret) {
-  const keys = Object.keys(params).sort();
-  let base = secret;
-  for (const k of keys) {
-    const v = params[k];
-    if (v !== undefined && v !== null && v !== "") base += `${k}${v}`;
-  }
-  base += secret;
-  return crypto.createHash("md5").update(base, "utf8").digest("hex").toUpperCase();
-}
-
-function sanitizeForLog(obj) {
-  const s = typeof obj === "string" ? obj : JSON.stringify(obj);
-  return s
-    .replace(/"sign"\s*:\s*"[^"]+"/g, '"sign":"***"')
-    .replace(/"app_key"\s*:\s*"[^"]+"/g, '"app_key":"***"')
-    .replace(/"appKey"\s*:\s*"[^"]+"/g, '"appKey":"***"')
-    .replace(/"secret"\s*:\s*"[^"]+"/g, '"secret":"***"')
-    .replace(/"token"\s*:\s*"[^"]+"/g, '"token":"***"')
-    .replace(/"TELEGRAM_BOT_TOKEN"\s*:\s*"[^"]+"/g, '"TELEGRAM_BOT_TOKEN":"***"')
-    .slice(0, 1800);
-}
-
-async function topPost(gateway, method, bizParams) {
-  const params = {
-    method,
-    app_key: AE_APP_KEY,
-    timestamp: topTimestamp(),
-    format: "json",
-    v: "2.0",
-    sign_method: "md5",
-    ...bizParams,
-  };
-
-  params.sign = signTopMd5(params, AE_APP_SECRET);
-
-  const res = await axios.post(gateway, new URLSearchParams(params), {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    timeout: 25000,
-  });
-
-  return res.data;
-}
-
-/* =========================
-   Gateways fallback
-   ========================= */
-function buildGatewayList() {
-  const envGw = (process.env.AE_GATEWAY || "").trim();
-  const list = [
-    envGw,
-    "https://eco.taobao.com/router/rest",
-    "https://api.taobao.com/router/rest",
-  ].filter(Boolean);
-
-  return [...new Set(list)];
-}
-
-function gwLabel(gw) {
-  if (!gw) return "none";
-  if (gw.includes("eco.taobao.com")) return "eco";
-  if (gw.includes("api.taobao.com")) return "api";
-  return "env";
-}
-
-/* =========================
-   Response extract + error summary
-   ========================= */
-function extractProducts(apiData) {
-  const root =
-    apiData?.aliexpress_affiliate_product_query_response ||
-    apiData?.aliexpress_affiliate_product_query_resp ||
-    apiData;
-
-  const products =
-    root?.resp_result?.result?.products?.product ||
-    root?.resp_result?.result?.products ||
-    root?.result?.products?.product ||
-    root?.result?.products ||
-    root?.resp_result?.products?.product ||
-    root?.resp_result?.products ||
-    [];
-
-  return Array.isArray(products) ? products : [];
-}
-
-function getApiErrorSummary(apiData) {
-  const root = apiData || {};
-
-  const err =
-    root?.error_response ||
-    root?.errorResponse ||
-    root?.resp_result?.error_response ||
-    root?.resp_result?.errorResponse ||
-    root?.resp_result?.result?.error_response ||
-    null;
-
-  if (err) return err;
-
-  const msg =
-    root?.resp_result?.error_msg ||
-    root?.resp_result?.errorMessage ||
-    root?.error_msg ||
-    root?.errorMessage ||
-    root?.msg ||
-    null;
-
-  if (msg) return { message: msg };
-
-  return null;
-}
-
-/* =========================
-   Arabic -> English hint (simple mapping)
-   ========================= */
-function arabicToEnglishHint(q) {
-  const s = q.trim().toLowerCase();
-  const map = [
-    [/شاحن\s*65w/g, "65w charger"],
-    [/65\s*واط/g, "65w"],
-    [/100\s*واط/g, "100w"],
-    [/شاحن/g, "charger"],
-    [/كابل/g, "cable"],
-    [/وصلة/g, "cable"],
-    [/باور\s*بانك/g, "power bank"],
-    [/بنك\s*طاقة/g, "power bank"],
-    [/ساعة\s*ذكية/g, "smartwatch"],
-    [/ساعة/g, "watch"],
-    [/سماعات/g, "earbuds"],
-    [/سماعة/g, "earbuds"],
-    [/بلوتوث/g, "bluetooth"],
-    [/لاسلكي/g, "wireless"],
-  ];
-
-  let out = s;
-  for (const [re, rep] of map) out = out.replace(re, rep);
-  if (out === s) return null;
-  return out;
-}
-
-/* =========================
-   Product Query with FULL fallback + FULL logging (sanitized)
-   ========================= */
-async function affiliateProductQueryWithFallback(keyword) {
-  const gateways = buildGatewayList();
-
-  const fields = [
-    "product_title",
-    "product_main_image_url",
-    "product_detail_url",
-    "app_sale_price",
-    "app_sale_price_currency",
-    "sale_price",
-    "sale_price_currency",
-    "original_price",
-    "original_price_currency",
-    "lastest_volume",
-    "evaluate_rate",
-  ].join(",");
-
-  const attempts = [];
-  attempts.push({ kw: keyword, withFields: true });
-  attempts.push({ kw: keyword, withFields: false });
-
-  const en = arabicToEnglishHint(keyword);
-  if (en) {
-    attempts.push({ kw: en, withFields: true });
-    attempts.push({ kw: en, withFields: false });
-  }
-
-  let lastInfo = null;
-
-  for (const gateway of gateways) {
-    for (const a of attempts) {
-      const biz = {
-        keywords: a.kw,
-        page_no: 1,
-        page_size: 50,
-        sort: "LAST_VOLUME_DESC",
-        target_language: "AR",
-        target_currency: "USD",
-        ship_to_country: "IL",
-        tracking_id: TRACKING_ID,
-      };
-      if (a.withFields) biz.fields = fields;
-
-      let data;
-      try {
-        if (DEBUG) {
-          console.log(
-            `API TRY -> gw=${gwLabel(gateway)} kw="${a.kw}" fields=${a.withFields}`
-          );
-        }
-        data = await topPost(gateway, "aliexpress.affiliate.product.query", biz);
-      } catch (e) {
-        lastInfo = {
-          gw: gwLabel(gateway),
-          kw: a.kw,
-          withFields: a.withFields,
-          networkError: e?.message || "request_failed",
-        };
-        console.log("API NET ERR:", sanitizeForLog(lastInfo));
-        continue;
-      }
-
-      const err = getApiErrorSummary(data);
-      const products = extractProducts(data);
-
-      lastInfo = {
-        gw: gwLabel(gateway),
-        kw: a.kw,
-        withFields: a.withFields,
-        productsCount: products.length,
-        hasError: !!err,
-        error: err || null,
-        respSnippet: sanitizeForLog(data),
-      };
-
-      if (products.length === 0) {
-        console.log("API 0 RESULTS:", sanitizeForLog(lastInfo));
-      }
-
-      if (products.length > 0) {
-        if (DEBUG) console.log("API SUCCESS:", sanitizeForLog(lastInfo));
-        return { products, usedKeyword: a.kw, gateway };
-      }
-    }
-  }
-
-  console.log("API FINAL FAIL:", sanitizeForLog(lastInfo || { note: "no_attempts" }));
-  return { products: [], usedKeyword: keyword, gateway: null };
-}
-
-/* =========================
-   Normalize products
-   ========================= */
-function normalizeProducts(products) {
-  return products
-    .map((p) => {
-      const title = p?.product_title || p?.title || "بدون عنوان";
-
-      const priceVal =
-        p?.app_sale_price ||
-        p?.sale_price ||
-        p?.original_price ||
-        p?.target_app_sale_price ||
-        p?.target_sale_price ||
-        "";
-
-      const currency =
-        p?.app_sale_price_currency ||
-        p?.sale_price_currency ||
-        p?.original_price_currency ||
-        p?.target_app_sale_price_currency ||
-        p?.target_sale_price_currency ||
-        "USD";
-
-      const ordersNumber = Number(
-        p?.lastest_volume ?? p?.last_volume ?? p?.volume ?? p?.sales_count ?? 0
-      ) || 0;
-
-      const rating = p?.evaluate_rate || p?.avg_evaluate_rate || p?.rating || "—";
-
-      const image =
-        p?.product_main_image_url ||
-        p?.product_main_image ||
-        p?.product_small_image_urls?.string?.[0] ||
-        p?.product_small_image_urls?.[0] ||
-        p?.image_url ||
-        "";
-
-      const detailUrl = p?.product_detail_url || p?.product_url || p?.url || "";
-
-      return {
-        title,
-        priceVal: String(priceVal),
-        currency: String(currency),
-        ordersNumber,
-        rating: String(rating),
-        image,
-        detailUrl,
-        affiliateLink: "",
-      };
-    })
-    .filter((x) => x.image) // شرطنا الوحيد: صورة
-    .sort((a, b) => b.ordersNumber - a.ordersNumber);
-}
-
-/* =========================
-   Link Generate (affiliate)
-   ========================= */
-async function affiliateLinkGenerate(sourceUrls) {
-  const gateways = buildGatewayList();
-  for (const gateway of gateways) {
-    try {
-      const data = await topPost(gateway, "aliexpress.affiliate.link.generate", {
-        promotion_link_type: 0,
-        source_values: sourceUrls.join(","),
-        tracking_id: TRACKING_ID,
-      });
-      return data;
-    } catch (e) {
-      console.error("link.generate failed:", gwLabel(gateway), e?.message);
-    }
-  }
-  return null;
-}
-
-function extractPromotionLinks(apiData) {
-  if (!apiData) return [];
-  const root =
-    apiData?.aliexpress_affiliate_link_generate_response ||
-    apiData?.aliexpress_affiliate_link_generate_resp ||
-    apiData;
-
-  const arr =
-    root?.resp_result?.result?.promotion_links?.promotion_link ||
-    root?.result?.promotion_links?.promotion_link ||
-    [];
-
-  return Array.isArray(arr) ? arr : [];
-}
-
-/* =========================
-   Collage (2x2)
-   ========================= */
-function numberBadgeSVG(num) {
-  return `
-  <svg width="120" height="120">
-    <circle cx="60" cy="60" r="52" fill="#ff5a2a"/>
-    <text x="60" y="78" font-size="64" text-anchor="middle"
-          fill="#ffffff" font-family="Arial" font-weight="700">${num}</text>
-  </svg>`;
-}
-
-async function fetchImageBuffer(url) {
-  const res = await axios.get(url, { responseType: "arraybuffer", timeout: 25000 });
-  return Buffer.from(res.data);
-}
-
-async function buildCollage(items) {
-  const SIZE = 1000;
-  const HALF = SIZE / 2;
-
-  const base = sharp({
-    create: {
-      width: SIZE,
-      height: SIZE,
-      channels: 3,
-      background: { r: 255, g: 255, b: 255 },
-    },
-  });
-
-  const layers = [];
-
-  for (let i = 0; i < 4; i++) {
-    const buf = await fetchImageBuffer(items[i].image);
-    const img = await sharp(buf).resize(HALF, HALF, { fit: "cover" }).toBuffer();
-
-    const left = (i % 2) * HALF;
-    const top = i < 2 ? 0 : HALF;
-
-    layers.push({ input: img, left, top });
-    layers.push({
-      input: Buffer.from(numberBadgeSVG(i + 1)),
-      left: left + 20,
-      top: top + 20,
-    });
-  }
-
-  layers.push({
-    input: Buffer.from(`
-      <svg width="${SIZE}" height="${SIZE}">
-        <rect x="${HALF - 2}" y="0" width="4" height="${SIZE}" fill="#ffffff" opacity="0.95"/>
-        <rect x="0" y="${HALF - 2}" width="${SIZE}" height="4" fill="#ffffff" opacity="0.95"/>
-      </svg>
-    `),
-    left: 0,
-    top: 0,
-  });
-
-  return base.composite(layers).jpeg({ quality: 85 }).toBuffer();
-}
-
-function formatPriceLine(p) {
-  const ils = p.currency.toUpperCase() === "USD" ? usdToIls(p.priceVal) : null;
-  if (ils !== null) return `₪${ils.toFixed(2)} (USD ${p.priceVal})`;
-  return `${p.currency} ${p.priceVal}`;
-}
-
-function buildCaption(query, items, usedKeyword) {
-  let msg = `🔥 أفضل 4 منتجات (الأكثر طلبًا)\n`;
-  msg += `🔎 البحث: ${query}\n`;
-  if (usedKeyword && usedKeyword !== query) msg += `➡️ تم استخدام: ${usedKeyword}\n`;
-  msg += `\n`;
-
-  items.forEach((p, i) => {
-    const link = p.affiliateLink || p.detailUrl || "—";
-    msg += `${i + 1}️⃣ ${p.title}\n`;
-    msg += `💰 السعر: ${formatPriceLine(p)}\n`;
-    msg += `🛒 المبيعات: ${p.ordersNumber}\n`;
-    msg += `⭐ التقييم: ${p.rating}\n`;
-    msg += `🔗 الرابط: ${link}\n\n`;
-  });
-
-  return msg;
-}
-
-/* =========================
-   Telegram handlers
-   ========================= */
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(
+app.post(WEBHOOK_PATH, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
+// =====================
+// Bot UX
+// =====================
+bot.onText(/\/start/, async (msg) => {
+  await bot.sendMessage(
     msg.chat.id,
-    "أهلًا 👋\nاكتب مثلًا:\nابحث عن شاحن 65W\nابحث عن ساعة ذكية\nابحث لي عن سماعات\n\nإذا النتائج صفر بالعربي، جرّب إنجليزي: charger / earbuds / smartwatch"
+    `أهلًا 👋\nاكتب مثلًا:\nابحث عن ساعة ذكية\nابحث لي عن شاحن 65W`
   );
 });
 
-function parseQuery(text) {
-  return text.replace(/^\s*ابحث(\s+لي)?\s+عن\s+/i, "").trim();
-}
-
 bot.on("message", async (msg) => {
-  const chatId = msg.chat.id;
-  const text = (msg.text || "").trim();
-  if (!text || text.startsWith("/")) return;
-
-  const query = parseQuery(text);
-  if (!query) return bot.sendMessage(chatId, 'اكتب مثلًا: "ابحث عن شاحن 65W"');
-
   try {
-    bot.sendChatAction(chatId, "upload_photo");
+    if (!msg.text) return;
+    if (msg.text.startsWith("/start")) return;
 
-    const { products: rawProducts, usedKeyword, gateway } =
-      await affiliateProductQueryWithFallback(query);
+    const kw = extractKeyword(msg.text);
+    if (!kw) return;
 
-    const all = normalizeProducts(rawProducts);
+    await bot.sendChatAction(msg.chat.id, "typing");
 
-    console.log(
-      `rawProducts: ${rawProducts.length} withImage: ${all.length} (gw=${gwLabel(gateway)})`
-    );
+    const products = await getTop4ByOrders(kw);
 
-    if (all.length < 4) {
-      return bot.sendMessage(
-        chatId,
-        "ما لقيت نتائج كافية من API.\nجرّب كلمة أبسط أو إنجليزي مثل: charger / power bank / smartwatch.\n\n(راجع Render Logs: سيظهر سطر API 0 RESULTS فيه سبب المشكلة)"
+    if (!products || products.length < 4) {
+      await bot.sendMessage(msg.chat.id, "ما لقيت نتائج كافية. جرّب كلمة ثانية 🙂");
+      return;
+    }
+
+    // نص مرتب
+    const lines = [];
+    for (let i = 0; i < 4; i++) {
+      const p = products[i];
+      const price = formatILS(p.price);
+      const orders = p.orders ?? "—";
+      const rating = p.rating ?? "—";
+
+      // رابط أفلييت (إذا فشل، بنستخدم رابط المنتج)
+      const link = (await safeAffiliateLink(p.detailUrl)) || p.detailUrl;
+
+      lines.push(
+        `${["1️⃣","2️⃣","3️⃣","4️⃣"][i]} ${truncate(p.title, 70)}\n` +
+        `💰 السعر: ${price}\n` +
+        `🛒 المبيعات: ${orders}\n` +
+        `⭐ التقييم: ${rating}\n` +
+        `${link}`
       );
     }
 
-    const top4 = all.slice(0, 4);
-
-    // توليد روابط أفلييت إذا توفر detailUrl
-    const urls = top4.map((p) => p.detailUrl).filter(Boolean);
-
-    if (urls.length) {
-      const linkData = await affiliateLinkGenerate(urls);
-      if (linkData) {
-        const linksArr = extractPromotionLinks(linkData);
-        const linkMap = new Map();
-        for (const row of linksArr) {
-          if (row?.source_value && row?.promotion_link) {
-            linkMap.set(row.source_value, row.promotion_link);
-          }
-        }
-        top4.forEach((p) => {
-          p.affiliateLink = p.detailUrl ? (linkMap.get(p.detailUrl) || "") : "";
-        });
-      }
-    }
-
-    const collage = await buildCollage(top4);
-    const caption = buildCaption(query, top4, usedKeyword);
-
-    await bot.sendPhoto(chatId, collage, { caption });
-  } catch (err) {
-    console.error("BOT ERROR:", sanitizeForLog(err?.response?.data || err.message));
-    bot.sendMessage(
-      chatId,
-      "صار خطأ 😅\nافتح Render Logs وخذ السطر اللي يبدأ بـ API 0 RESULTS أو API FINAL FAIL وابعثه لي."
-    );
+    await bot.sendMessage(msg.chat.id, lines.join("\n\n"), {
+      disable_web_page_preview: false,
+    });
+  } catch (e) {
+    console.error("Message handler error:", e?.message || e);
+    await bot.sendMessage(msg.chat.id, "صار خطأ بسيط. جرّب مرة ثانية 🙏");
   }
 });
 
-console.log("Deals48 bot running (webhook mode)...")
+function extractKeyword(text) {
+  const t = (text || "").trim();
+  // أمثلة: "ابحث عن ..." / "ابحث لي عن ..." / "ابحث ..." / "بحث ..."
+  const patterns = [
+    /^ابحث\s+لي\s+عن\s+/,
+    /^ابحث\s+عن\s+/,
+    /^ابحث\s+/,
+    /^بحث\s+عن\s+/,
+  ];
+  for (const re of patterns) {
+    if (re.test(t)) return t.replace(re, "").trim();
+  }
+  // إذا كتب كلمة مباشرة
+  if (t.length >= 2) return t;
+  return "";
+}
+
+function truncate(s, n) {
+  if (!s) return "";
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+function formatILS(price) {
+  if (price === null || price === undefined) return "—";
+  const num = Number(price);
+  if (Number.isFinite(num)) return `₪${num.toFixed(2)}`;
+  // إذا جاي نص
+  const p = String(price);
+  return p.includes("₪") ? p : `₪${p}`;
+}
+
+// =====================
+// AliExpress API
+// =====================
+
+// جرّب أكثر من Gateway (الأهم api-sg)
+function buildGateways() {
+  const list = [
+    AE_GATEWAY, // إذا محدد في Render
+    "https://api-sg.aliexpress.com/sync", // شائع للـ Affiliate APIs :contentReference[oaicite:2]{index=2}
+    // احتياط (قد يفيد لبعض الحسابات القديمة، لكنه قد يعطي appkey-not-exists)
+    "https://eco.taobao.com/router/rest",
+    "https://gw.api.taobao.com/router/rest",
+  ].filter(Boolean);
+
+  // إزالة تكرار
+  return [...new Set(list)];
+}
+
+function md5Upper(s) {
+  return crypto.createHash("md5").update(s, "utf8").digest("hex").toUpperCase();
+}
+
+function sortKeys(obj) {
+  return Object.keys(obj)
+    .sort()
+    .reduce((acc, k) => {
+      acc[k] = obj[k];
+      return acc;
+    }, {});
+}
+
+// توقيع “TOP style”: keyvaluekeyvalue (مثل شروحات كثيرة) :contentReference[oaicite:3]{index=3}
+function signTopPairs(params, secret) {
+  const sorted = sortKeys({ ...params });
+  delete sorted.sign;
+
+  let long = "";
+  for (const k of Object.keys(sorted)) {
+    const v = sorted[k];
+    if (v === undefined || v === null || v === "") continue;
+    long += `${k}${v}`;
+  }
+  return md5Upper(`${secret}${long}${secret}`);
+}
+
+// توقيع “querystring style”: key=value&key=value (يظهر في أمثلة كثيرة للـ /sync)
+function signQueryString(params, secret) {
+  const sorted = sortKeys({ ...params });
+  delete sorted.sign;
+
+  const qs = Object.keys(sorted)
+    .filter((k) => sorted[k] !== undefined && sorted[k] !== null && sorted[k] !== "")
+    .map((k) => `${k}=${sorted[k]}`)
+    .join("&");
+
+  return md5Upper(`${secret}${qs}${secret}`);
+}
+
+async function postForm(url, params) {
+  const body = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) body.append(k, String(v));
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded;charset=utf-8" },
+    body,
+  });
+
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw: text };
+  }
+}
+
+function pickProductsFromResponse(resp) {
+  // أشكال مختلفة حسب الـ gateway
+  // Taobao/TOP:
+  // resp.aliexpress_affiliate_product_query_response?.resp_result?.result?.products?.product
+  const a =
+    resp?.aliexpress_affiliate_product_query_response?.resp_result?.result?.products?.product;
+
+  if (Array.isArray(a)) return a;
+
+  // أحيانًا تكون products.product عنصر واحد
+  if (a && typeof a === "object") return [a];
+
+  // بعض الردود قد تكون مباشرة:
+  const b = resp?.result?.products?.product;
+  if (Array.isArray(b)) return b;
+  if (b && typeof b === "object") return [b];
+
+  return [];
+}
+
+function normalizeProduct(p) {
+  const title =
+    p?.product_title || p?.title || p?.productTitle || p?.item_title || "";
+
+  const img =
+    p?.product_main_image_url || p?.productMainImageUrl || p?.image_url || p?.imageUrl || "";
+
+  const detailUrl =
+    p?.product_detail_url || p?.productDetailUrl || p?.detail_url || p?.product_url || "";
+
+  // السعر: أحيانًا sale_price مثل "US $12.34"
+  const sale = p?.sale_price || p?.target_sale_price || p?.salePrice || p?.price || "";
+  const price = extractNumber(sale);
+
+  // المبيعات: orders أو volume
+  const orders =
+    toInt(p?.orders) ??
+    toInt(p?.lastest_volume) ??
+    toInt(p?.volume) ??
+    toInt(p?.sale_num) ??
+    null;
+
+  // التقييم: evaluate_rate أو rating
+  const rating =
+    p?.evaluate_rate ||
+    p?.evaluateRate ||
+    p?.rating ||
+    p?.score ||
+    null;
+
+  return {
+    title: title || "منتج",
+    img,
+    detailUrl,
+    price,
+    orders,
+    rating,
+  };
+}
+
+function extractNumber(x) {
+  if (x === null || x === undefined) return null;
+  const s = String(x);
+  const m = s.match(/(\d+(\.\d+)?)/);
+  return m ? Number(m[1]) : null;
+}
+
+function toInt(x) {
+  if (x === null || x === undefined) return null;
+  const n = Number(String(x).replace(/[^\d]/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
+
+async function callAffiliate(method, extraParams) {
+  if (!AE_APP_KEY || !AE_APP_SECRET) {
+    return { error: "Missing AE_APP_KEY/AE_APP_SECRET" };
+  }
+
+  const gateways = buildGateways();
+
+  // جرّب نوعين timestamp + نوعين توقيع
+  const tsShanghai = dayjs().tz("Asia/Shanghai").format("YYYY-MM-DD HH:mm:ss"); // :contentReference[oaicite:4]{index=4}
+  const tsUnix = Math.floor(Date.now() / 1000);
+
+  const attempts = [
+    { timestamp: tsShanghai, signFn: signTopPairs, tag: "shanghai/topPairs" },
+    { timestamp: tsShanghai, signFn: signQueryString, tag: "shanghai/queryStr" },
+    { timestamp: tsUnix, signFn: signTopPairs, tag: "unix/topPairs" },
+    { timestamp: tsUnix, signFn: signQueryString, tag: "unix/queryStr" },
+  ];
+
+  let lastResp = null;
+
+  for (const gw of gateways) {
+    for (const att of attempts) {
+      const payload = {
+        method,
+        app_key: AE_APP_KEY,
+        sign_method: "md5",
+        format: "json",
+        v: "2.0",
+        timestamp: att.timestamp,
+        ...extraParams,
+      };
+
+      const sign = att.signFn(payload, AE_APP_SECRET);
+      const full = { ...payload, sign };
+
+      // لوج مختصر بدون أسرار
+      console.log(`API TRY -> gw=${gw} method=${method} (${att.tag})`);
+
+      const resp = await postForm(gw, full);
+      lastResp = resp;
+
+      // أخطاء TOP غالبًا تحت error_response
+      const err = resp?.error_response;
+      if (!err) return resp;
+
+      // لو المشكلة appkey-not-exists على بوابة معينة: انتقل للبوابة التالية مباشرة
+      const sub = err?.sub_code || "";
+      if (String(sub).includes("appkey-not-exists")) {
+        console.log(`API ERROR appkey-not-exists on gw=${gw} -> switch gateway`);
+        break;
+      }
+
+      // لو مشكلة توقيع: جرّب attempt التالي
+      console.log(`API ERROR -> ${err?.code} ${err?.msg} sub=${sub || "-"}`);
+    }
+  }
+
+  return lastResp || { error: "No response" };
+}
+
+async function getTop4ByOrders(keyword) {
+  // 1) استعلام منتجات
+  const resp = await callAffiliate("aliexpress.affiliate.product.query", {
+    keywords: keyword,
+    page_no: 1,
+    page_size: 50,
+    // إعدادات لغة/عملة حسب احتياجك (قد لا تُطبق في كل الحالات)
+    target_language: "AR",
+    target_currency: "ILS",
+    // بعض الحسابات تحتاج tracking_id حتى في query
+    tracking_id: AE_TRACKING_ID || "",
+  });
+
+  const raw = pickProductsFromResponse(resp);
+  const norm = raw.map(normalizeProduct).filter((p) => p.detailUrl);
+
+  console.log(`rawProducts: ${raw.length} normalized: ${norm.length}`);
+
+  // فلترة أعلى مبيعات
+  const sorted = norm
+    .filter((p) => p.img) // بدنا صورة للكولاج لاحقًا
+    .sort((a, b) => (b.orders || 0) - (a.orders || 0));
+
+  return sorted.slice(0, 4);
+}
+
+async function safeAffiliateLink(detailUrl) {
+  try {
+    if (!detailUrl) return "";
+    if (!AE_TRACKING_ID) return detailUrl;
+
+    const resp = await callAffiliate("aliexpress.affiliate.link.generate", {
+      promotion_link_type: 0,
+      source_values: detailUrl,
+      tracking_id: AE_TRACKING_ID,
+    });
+
+    // أشكال مختلفة للرد
+    const link =
+      resp?.aliexpress_affiliate_link_generate_response?.resp_result?.result?.promotion_links?.promotion_link?.[0]?.promotion_link ||
+      resp?.aliexpress_affiliate_link_generate_response?.resp_result?.result?.promotion_links?.promotion_link?.promotion_link ||
+      resp?.result?.promotion_links?.promotion_link?.[0]?.promotion_link ||
+      "";
+
+    return link || detailUrl;
+  } catch {
+    return detailUrl;
+  }
+}
