@@ -31,7 +31,7 @@ const USD_TO_ILS_RATE = Number(process.env.USD_TO_ILS_RATE || "0"); // example 3
 /* =========================
    Telegram webhook server
 ========================= */
-const bot = new TelegramBot(token); // webhook mode
+const bot = new TelegramBot(token);
 const WEBHOOK_PATH = `/bot${token}`;
 const PORT = Number(process.env.PORT || 10000);
 
@@ -181,7 +181,7 @@ function getApiErrorSummary(apiData) {
 }
 
 /* =========================
-   Arabic -> English hint (improves results)
+   Arabic -> English hint
 ========================= */
 function arabicToEnglishHint(q) {
   const s = q.trim().toLowerCase();
@@ -225,6 +225,7 @@ async function affiliateProductQueryWithFallback(keyword) {
     "original_price_currency",
     "lastest_volume",
     "evaluate_rate",
+    "product_id",
   ].join(",");
 
   const attempts = [];
@@ -293,7 +294,6 @@ function cleanTitle(title, maxLen = 55, maxWords = 9) {
 
   let t = String(title);
 
-  // clean
   t = t
     .replace(/[™®©]/g, "")
     .replace(/\s+/g, " ")
@@ -306,13 +306,11 @@ function cleanTitle(title, maxLen = 55, maxWords = 9) {
 
   if (!t) return "منتج";
 
-  // limit words first
   const words = t.split(" ").filter(Boolean);
   const shortened = words.slice(0, maxWords).join(" ");
 
   if (shortened.length <= maxLen) return shortened;
 
-  // cut to last space within maxLen (no ellipsis)
   const cut = shortened.slice(0, maxLen).trim();
   const lastSpace = cut.lastIndexOf(" ");
   if (lastSpace > 15) return cut.slice(0, lastSpace).trim();
@@ -377,6 +375,102 @@ function relevanceScore(query, title) {
 }
 
 /* =========================
+   DEDUPE helpers
+========================= */
+function extractItemIdFromUrl(url) {
+  try {
+    const u = String(url || "");
+    // common AliExpress item id: /item/100500xxxx.html
+    const m = u.match(/\/item\/(\d+)\.html/i) || u.match(/item\/(\d+)/i);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeImageKey(url) {
+  try {
+    const u = new URL(url);
+    return `${u.origin}${u.pathname}`; // drop query
+  } catch {
+    // fallback: strip query manually
+    return String(url || "").split("?")[0];
+  }
+}
+
+function tokenizeTitleForSimilarity(t) {
+  return String(t || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 2);
+}
+
+function jaccard(aTokens, bTokens) {
+  const a = new Set(aTokens);
+  const b = new Set(bTokens);
+  if (!a.size || !b.size) return 0;
+
+  let inter = 0;
+  for (const x of a) if (b.has(x)) inter++;
+  const union = a.size + b.size - inter;
+  return union ? inter / union : 0;
+}
+
+function pickTop4Unique(sortedCandidates) {
+  // Pass 1: strict (id + image + near-title similarity)
+  const pass = (opts) => {
+    const chosen = [];
+    const seenIds = new Set();
+    const seenImages = new Set();
+    const chosenTitleTokens = [];
+
+    for (const p of sortedCandidates) {
+      if (chosen.length >= 4) break;
+
+      const pid = p.productId || null;
+      const imgKey = p.imageKey || p.image;
+
+      if (opts.checkId && pid && seenIds.has(pid)) continue;
+      if (opts.checkImage && imgKey && seenImages.has(imgKey)) continue;
+
+      if (opts.checkNearTitle) {
+        const tok = p._titleTokens;
+        let near = false;
+        for (const prev of chosenTitleTokens) {
+          if (jaccard(tok, prev) >= opts.simThreshold) {
+            near = true;
+            break;
+          }
+        }
+        if (near) continue;
+      }
+
+      if (opts.checkId && pid) seenIds.add(pid);
+      if (opts.checkImage && imgKey) seenImages.add(imgKey);
+      if (opts.checkNearTitle) chosenTitleTokens.push(p._titleTokens);
+
+      chosen.push(p);
+    }
+    return chosen;
+  };
+
+  // strict -> medium -> loose
+  let out = pass({ checkId: true, checkImage: true, checkNearTitle: true, simThreshold: 0.82 });
+  if (out.length < 4) {
+    out = pass({ checkId: true, checkImage: true, checkNearTitle: true, simThreshold: 0.72 });
+  }
+  if (out.length < 4) {
+    out = pass({ checkId: true, checkImage: true, checkNearTitle: false, simThreshold: 0 });
+  }
+  if (out.length < 4) {
+    // last resort: take first 4
+    out = sortedCandidates.slice(0, 4);
+  }
+  return out;
+}
+
+/* =========================
    Normalize products
 ========================= */
 function normalizeProducts(rawProducts, query) {
@@ -420,17 +514,27 @@ function normalizeProducts(rawProducts, query) {
 
       const rel = relevanceScore(query, title);
 
+      const productId =
+        String(p?.product_id || p?.item_id || p?.productId || "").trim() ||
+        extractItemIdFromUrl(detailUrl) ||
+        null;
+
+      const imageKey = image ? normalizeImageKey(image) : "";
+
       return {
         title,
         shortTitle,
         image,
+        imageKey,
         detailUrl,
         priceNum,
         currency,
         orders,
         rating5,
         rel,
+        productId,
         affiliateLink: "",
+        _titleTokens: tokenizeTitleForSimilarity(shortTitle),
       };
     })
     .filter((x) => x.image && x.detailUrl);
@@ -475,7 +579,6 @@ function extractPromotionLinks(apiData) {
    Collage 2x2 (NO TEXT) + smaller numbers
 ========================= */
 function numberBadgeSVG(num) {
-  // أصغر قليلًا
   return `
   <svg width="78" height="78">
     <circle cx="39" cy="39" r="33" fill="#ff5a2a"/>
@@ -516,7 +619,6 @@ async function buildCollage(items) {
 
     layers.push({ input: img, left, top });
 
-    // الرقم
     layers.push({
       input: Buffer.from(numberBadgeSVG(i + 1)),
       left: left + 14,
@@ -524,7 +626,6 @@ async function buildCollage(items) {
     });
   }
 
-  // فواصل بسيطة
   layers.push({
     input: Buffer.from(`
       <svg width="${SIZE}" height="${SIZE}">
@@ -554,7 +655,7 @@ function buildCaption(query, items) {
     msg += `💰 السعر: ${priceText}\n`;
     msg += `🛒 المبيعات: ${p.orders}\n`;
     msg += `⭐ التقييم: ${ratingText}\n`;
-    msg += `${link}\n\n`; // فقط الرابط
+    msg += `${link}\n\n`;
   });
 
   return msg.trim();
@@ -594,17 +695,20 @@ bot.on("message", async (msg) => {
 
     const normAll = normalizeProducts(rawProducts, query);
 
-    // فلترة صلة (ولو ما كفت نخفف)
+    // filter relevance if possible
     let candidates = normAll.filter((p) => p.rel >= 2);
     if (candidates.length < 4) candidates = normAll;
 
-    // ترتيب: صلة ثم مبيعات
+    // sort: relevance then orders
     candidates.sort((a, b) => (b.rel - a.rel) || (b.orders - a.orders));
 
-    const top4 = candidates.slice(0, 4);
+    // DEDUPE هنا ✅
+    const top4 = pickTop4Unique(candidates);
 
     console.log(
-      `rawProducts: ${rawProducts.length} normalized: ${normAll.length} top4: ${top4.length} (gw=${gwLabel(gateway)})`
+      `rawProducts: ${rawProducts.length} normalized: ${normAll.length} picked: ${top4.length} (gw=${gwLabel(
+        gateway
+      )})`
     );
 
     if (top4.length < 4) {
