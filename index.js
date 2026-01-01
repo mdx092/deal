@@ -25,16 +25,15 @@ if (!TRACKING_ID) throw new Error("Missing TRACKING_ID");
 const DEBUG = String(process.env.DEBUG || "").trim() === "1";
 
 /**
- * تحويل USD -> ILS اختياري (ضع USD_TO_ILS_RATE في Render مثل 3.7)
+ * تحويل USD -> ILS اختياري
+ * ضع USD_TO_ILS_RATE في Render مثل: 3.7
  */
 const USD_TO_ILS_RATE = Number(process.env.USD_TO_ILS_RATE || "0"); // 0 = بدون تحويل
-
 function usdToIls(usdStr) {
   const usd = Number(String(usdStr).replace(/[^\d.]/g, ""));
   if (!Number.isFinite(usd) || usd <= 0) return null;
   if (!USD_TO_ILS_RATE || USD_TO_ILS_RATE <= 0) return null;
-  const ils = usd * USD_TO_ILS_RATE;
-  return ils;
+  return usd * USD_TO_ILS_RATE;
 }
 
 /* =========================
@@ -44,18 +43,18 @@ const bot = new TelegramBot(token); // no polling
 const WEBHOOK_PATH = `/bot${token}`;
 const PORT = process.env.PORT || 3000;
 
+// Set webhook
 bot.setWebHook(`${PUBLIC_URL}${WEBHOOK_PATH}`);
 console.log("Webhook set ✅");
 
+// HTTP server: health + webhook receiver
 http
   .createServer((req, res) => {
-    // health
     if (req.method === "GET" && req.url === "/") {
       res.writeHead(200, { "Content-Type": "text/plain" });
       return res.end("OK");
     }
 
-    // webhook updates
     if (req.method === "POST" && req.url === WEBHOOK_PATH) {
       let body = "";
       req.on("data", (chunk) => (body += chunk));
@@ -101,15 +100,15 @@ function signTopMd5(params, secret) {
 }
 
 function sanitizeForLog(obj) {
-  // لا تطبع أشياء حساسة حتى لو ظهرت بالخطأ
-  const s = JSON.stringify(obj);
+  const s = typeof obj === "string" ? obj : JSON.stringify(obj);
   return s
     .replace(/"sign"\s*:\s*"[^"]+"/g, '"sign":"***"')
     .replace(/"app_key"\s*:\s*"[^"]+"/g, '"app_key":"***"')
     .replace(/"appKey"\s*:\s*"[^"]+"/g, '"appKey":"***"')
     .replace(/"secret"\s*:\s*"[^"]+"/g, '"secret":"***"')
     .replace(/"token"\s*:\s*"[^"]+"/g, '"token":"***"')
-    .slice(0, 1600);
+    .replace(/"TELEGRAM_BOT_TOKEN"\s*:\s*"[^"]+"/g, '"TELEGRAM_BOT_TOKEN":"***"')
+    .slice(0, 1800);
 }
 
 async function topPost(gateway, method, bizParams) {
@@ -137,7 +136,6 @@ async function topPost(gateway, method, bizParams) {
    Gateways fallback
    ========================= */
 function buildGatewayList() {
-  // جرّب بالترتيب: env -> eco -> api (بدون تكرار)
   const envGw = (process.env.AE_GATEWAY || "").trim();
   const list = [
     envGw,
@@ -145,12 +143,18 @@ function buildGatewayList() {
     "https://api.taobao.com/router/rest",
   ].filter(Boolean);
 
-  // إزالة التكرار
   return [...new Set(list)];
 }
 
+function gwLabel(gw) {
+  if (!gw) return "none";
+  if (gw.includes("eco.taobao.com")) return "eco";
+  if (gw.includes("api.taobao.com")) return "api";
+  return "env";
+}
+
 /* =========================
-   AliExpress: Product Query + Fallbacks
+   Response extract + error summary
    ========================= */
 function extractProducts(apiData) {
   const root =
@@ -163,6 +167,8 @@ function extractProducts(apiData) {
     root?.resp_result?.result?.products ||
     root?.result?.products?.product ||
     root?.result?.products ||
+    root?.resp_result?.products?.product ||
+    root?.resp_result?.products ||
     [];
 
   return Array.isArray(products) ? products : [];
@@ -170,35 +176,40 @@ function extractProducts(apiData) {
 
 function getApiErrorSummary(apiData) {
   const root = apiData || {};
-  // بعض الردود تأتي داخل error_response أو داخل resp_result
+
   const err =
     root?.error_response ||
     root?.errorResponse ||
     root?.resp_result?.error_response ||
     root?.resp_result?.errorResponse ||
+    root?.resp_result?.result?.error_response ||
     null;
 
   if (err) return err;
 
-  const maybeMsg =
+  const msg =
     root?.resp_result?.error_msg ||
     root?.resp_result?.errorMessage ||
     root?.error_msg ||
     root?.errorMessage ||
+    root?.msg ||
     null;
 
-  if (maybeMsg) return { message: maybeMsg };
+  if (msg) return { message: msg };
 
   return null;
 }
 
+/* =========================
+   Arabic -> English hint (simple mapping)
+   ========================= */
 function arabicToEnglishHint(q) {
-  // تحويل بسيط لكلمات شائعة فقط (بدون ترجمة كاملة)
   const s = q.trim().toLowerCase();
-
   const map = [
+    [/شاحن\s*65w/g, "65w charger"],
+    [/65\s*واط/g, "65w"],
+    [/100\s*واط/g, "100w"],
     [/شاحن/g, "charger"],
-    [/شواحن/g, "charger"],
     [/كابل/g, "cable"],
     [/وصلة/g, "cable"],
     [/باور\s*بانك/g, "power bank"],
@@ -209,25 +220,20 @@ function arabicToEnglishHint(q) {
     [/سماعة/g, "earbuds"],
     [/بلوتوث/g, "bluetooth"],
     [/لاسلكي/g, "wireless"],
-    [/شاحن\s*65w/g, "65w charger"],
-    [/65w/g, "65w"],
-    [/65\s*واط/g, "65w"],
-    [/100w/g, "100w"],
-    [/100\s*واط/g, "100w"],
   ];
 
   let out = s;
   for (const [re, rep] of map) out = out.replace(re, rep);
-
-  // إذا لم يتغير شيء، رجّع null
   if (out === s) return null;
   return out;
 }
 
+/* =========================
+   Product Query with FULL fallback + FULL logging (sanitized)
+   ========================= */
 async function affiliateProductQueryWithFallback(keyword) {
   const gateways = buildGatewayList();
 
-  // fields أحيانًا يسبب 0 على بعض الحسابات، لذلك نجرب معه ثم بدونه
   const fields = [
     "product_title",
     "product_main_image_url",
@@ -243,17 +249,16 @@ async function affiliateProductQueryWithFallback(keyword) {
   ].join(",");
 
   const attempts = [];
-
-  // المحاولة 1: عربي/نص المستخدم كما هو
   attempts.push({ kw: keyword, withFields: true });
   attempts.push({ kw: keyword, withFields: false });
 
-  // المحاولة 2: إنجليزي (إذا كان عربي)
   const en = arabicToEnglishHint(keyword);
   if (en) {
     attempts.push({ kw: en, withFields: true });
     attempts.push({ kw: en, withFields: false });
   }
+
+  let lastInfo = null;
 
   for (const gateway of gateways) {
     for (const a of attempts) {
@@ -267,53 +272,57 @@ async function affiliateProductQueryWithFallback(keyword) {
         ship_to_country: "IL",
         tracking_id: TRACKING_ID,
       };
-
       if (a.withFields) biz.fields = fields;
 
       let data;
       try {
         if (DEBUG) {
           console.log(
-            `API TRY -> gw=${gateway.includes("eco") ? "eco" : gateway.includes("api.") ? "api" : "env"} kw="${a.kw}" fields=${a.withFields}`
+            `API TRY -> gw=${gwLabel(gateway)} kw="${a.kw}" fields=${a.withFields}`
           );
         }
         data = await topPost(gateway, "aliexpress.affiliate.product.query", biz);
       } catch (e) {
-        console.error("API request failed:", e?.message);
+        lastInfo = {
+          gw: gwLabel(gateway),
+          kw: a.kw,
+          withFields: a.withFields,
+          networkError: e?.message || "request_failed",
+        };
+        console.log("API NET ERR:", sanitizeForLog(lastInfo));
         continue;
       }
 
       const err = getApiErrorSummary(data);
       const products = extractProducts(data);
 
-      if (DEBUG) {
-        console.log(
-          "API RESP (short):",
-          sanitizeForLog({
-            gw: gateway,
-            kw: a.kw,
-            withFields: a.withFields,
-            hasError: !!err,
-            error: err || undefined,
-            productsCount: products.length,
-          })
-        );
+      lastInfo = {
+        gw: gwLabel(gateway),
+        kw: a.kw,
+        withFields: a.withFields,
+        productsCount: products.length,
+        hasError: !!err,
+        error: err || null,
+        respSnippet: sanitizeForLog(data),
+      };
+
+      if (products.length === 0) {
+        console.log("API 0 RESULTS:", sanitizeForLog(lastInfo));
       }
 
-      // لو في خطأ واضح، نكمّل لمحاولة ثانية
-      if (err && products.length === 0) continue;
-
-      // لو في منتجات، رجّعها
-      if (products.length > 0) return { products, usedKeyword: a.kw, gateway };
+      if (products.length > 0) {
+        if (DEBUG) console.log("API SUCCESS:", sanitizeForLog(lastInfo));
+        return { products, usedKeyword: a.kw, gateway };
+      }
     }
   }
 
-  // فشل كل المحاولات
+  console.log("API FINAL FAIL:", sanitizeForLog(lastInfo || { note: "no_attempts" }));
   return { products: [], usedKeyword: keyword, gateway: null };
 }
 
 /* =========================
-   Normalize + Link Generate
+   Normalize products
    ========================= */
 function normalizeProducts(products) {
   return products
@@ -363,13 +372,15 @@ function normalizeProducts(products) {
         affiliateLink: "",
       };
     })
-    .filter((x) => x.image) // أهم شرط: صورة
+    .filter((x) => x.image) // شرطنا الوحيد: صورة
     .sort((a, b) => b.ordersNumber - a.ordersNumber);
 }
 
+/* =========================
+   Link Generate (affiliate)
+   ========================= */
 async function affiliateLinkGenerate(sourceUrls) {
   const gateways = buildGatewayList();
-
   for (const gateway of gateways) {
     try {
       const data = await topPost(gateway, "aliexpress.affiliate.link.generate", {
@@ -379,13 +390,14 @@ async function affiliateLinkGenerate(sourceUrls) {
       });
       return data;
     } catch (e) {
-      console.error("link.generate failed on gateway:", e?.message);
+      console.error("link.generate failed:", gwLabel(gateway), e?.message);
     }
   }
   return null;
 }
 
 function extractPromotionLinks(apiData) {
+  if (!apiData) return [];
   const root =
     apiData?.aliexpress_affiliate_link_generate_response ||
     apiData?.aliexpress_affiliate_link_generate_resp ||
@@ -400,7 +412,7 @@ function extractPromotionLinks(apiData) {
 }
 
 /* =========================
-   Collage
+   Collage (2x2)
    ========================= */
 function numberBadgeSVG(num) {
   return `
@@ -467,8 +479,9 @@ function formatPriceLine(p) {
 }
 
 function buildCaption(query, items, usedKeyword) {
-  let msg = `🔥 أفضل 4 منتجات (الأكثر طلبًا) لبحث: ${query}\n`;
-  if (usedKeyword && usedKeyword !== query) msg += `🔎 تم البحث أيضًا بـ: ${usedKeyword}\n`;
+  let msg = `🔥 أفضل 4 منتجات (الأكثر طلبًا)\n`;
+  msg += `🔎 البحث: ${query}\n`;
+  if (usedKeyword && usedKeyword !== query) msg += `➡️ تم استخدام: ${usedKeyword}\n`;
   msg += `\n`;
 
   items.forEach((p, i) => {
@@ -480,7 +493,6 @@ function buildCaption(query, items, usedKeyword) {
     msg += `🔗 الرابط: ${link}\n\n`;
   });
 
-  msg += `🟠 جرّب كلمات بسيطة: شاحن / سماعات / ساعة أو بالإنجليزي (charger, earbuds, smartwatch)`;
   return msg;
 }
 
@@ -490,7 +502,7 @@ function buildCaption(query, items, usedKeyword) {
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "أهلًا 👋\nاكتب مثلًا:\nابحث عن شاحن 65W\nابحث عن ساعة ذكية\nابحث لي عن سماعات\n\n(لو النتائج صفر بالعربي، جرّب إنجليزي: charger / earbuds / smartwatch)"
+    "أهلًا 👋\nاكتب مثلًا:\nابحث عن شاحن 65W\nابحث عن ساعة ذكية\nابحث لي عن سماعات\n\nإذا النتائج صفر بالعربي، جرّب إنجليزي: charger / earbuds / smartwatch"
   );
 });
 
@@ -515,19 +527,19 @@ bot.on("message", async (msg) => {
     const all = normalizeProducts(rawProducts);
 
     console.log(
-      `rawProducts: ${rawProducts.length} withImage: ${all.length} (gw=${gateway ? (gateway.includes("eco") ? "eco" : gateway.includes("api.") ? "api" : "env") : "none"})`
+      `rawProducts: ${rawProducts.length} withImage: ${all.length} (gw=${gwLabel(gateway)})`
     );
 
     if (all.length < 4) {
       return bot.sendMessage(
         chatId,
-        "ما لقيت نتائج كافية من API.\nجرّب كلمة أبسط أو إنجليزي مثل: charger / power bank / smartwatch."
+        "ما لقيت نتائج كافية من API.\nجرّب كلمة أبسط أو إنجليزي مثل: charger / power bank / smartwatch.\n\n(راجع Render Logs: سيظهر سطر API 0 RESULTS فيه سبب المشكلة)"
       );
     }
 
     const top4 = all.slice(0, 4);
 
-    // حاول توليد روابط أفلييت فقط لو detailUrl موجود
+    // توليد روابط أفلييت إذا توفر detailUrl
     const urls = top4.map((p) => p.detailUrl).filter(Boolean);
 
     if (urls.length) {
@@ -536,7 +548,9 @@ bot.on("message", async (msg) => {
         const linksArr = extractPromotionLinks(linkData);
         const linkMap = new Map();
         for (const row of linksArr) {
-          if (row?.source_value && row?.promotion_link) linkMap.set(row.source_value, row.promotion_link);
+          if (row?.source_value && row?.promotion_link) {
+            linkMap.set(row.source_value, row.promotion_link);
+          }
         }
         top4.forEach((p) => {
           p.affiliateLink = p.detailUrl ? (linkMap.get(p.detailUrl) || "") : "";
@@ -549,12 +563,12 @@ bot.on("message", async (msg) => {
 
     await bot.sendPhoto(chatId, collage, { caption });
   } catch (err) {
-    console.error("BOT ERROR:", err?.response?.data || err.message);
+    console.error("BOT ERROR:", sanitizeForLog(err?.response?.data || err.message));
     bot.sendMessage(
       chatId,
-      "صار خطأ 😅\nإذا تكرر، فعّل DEBUG=1 في Render وابعت آخر Logs (بدون أسرار)."
+      "صار خطأ 😅\nافتح Render Logs وخذ السطر اللي يبدأ بـ API 0 RESULTS أو API FINAL FAIL وابعثه لي."
     );
   }
 });
 
-console.log("Deals48 bot running (webhook mode)...");
+console.log("Deals48 bot running (webhook mode)...")
