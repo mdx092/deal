@@ -15,19 +15,18 @@ if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 const PUBLIC_URL = process.env.PUBLIC_URL; // مثال: https://deal-jsyn.onrender.com
 if (!PUBLIC_URL) throw new Error("Missing PUBLIC_URL");
 
-// AliExpress Open Platform keys (من openservice)
-const AE_APP_KEY = process.env.AE_APP_KEY;
-const AE_APP_SECRET = process.env.AE_APP_SECRET;
-const TRACKING_ID = process.env.TRACKING_ID || ""; // اختياري لبعض الحسابات
+// AliExpress Open Platform keys (openservice)
+const AE_APP_KEY = (process.env.AE_APP_KEY || "").trim();
+const AE_APP_SECRET = (process.env.AE_APP_SECRET || "").trim();
+const TRACKING_ID = (process.env.TRACKING_ID || "").trim(); // اختياري
 
 if (!AE_APP_KEY || !AE_APP_SECRET) {
   throw new Error("Missing AE_APP_KEY or AE_APP_SECRET");
 }
 
-// مهم: خليها بوابة AliExpress (مش taobao)
+// مهم: بوابة AliExpress (مش taobao)
 const AE_GATEWAY =
-  (process.env.AE_GATEWAY || "").trim() ||
-  "https://api-sg.aliexpress.com/sync";
+  (process.env.AE_GATEWAY || "").trim() || "https://api-sg.aliexpress.com/sync";
 
 const DEBUG = String(process.env.DEBUG || "").trim() === "1";
 
@@ -47,9 +46,10 @@ const bot = new TelegramBot(token); // no polling
 const WEBHOOK_PATH = `/bot${token}`;
 const PORT = process.env.PORT || 10000;
 
-bot.setWebHook(`${PUBLIC_URL}${WEBHOOK_PATH}`).then(() => {
-  console.log("Webhook set ✅");
-});
+bot
+  .setWebHook(`${PUBLIC_URL}${WEBHOOK_PATH}`)
+  .then(() => console.log("Webhook set ✅"))
+  .catch((e) => console.error("Webhook error:", e?.message || e));
 
 http
   .createServer((req, res) => {
@@ -85,8 +85,6 @@ console.log("Deals48 bot running (webhook mode)...");
 /* =========================
    Helpers: timestamp + sign
 ========================= */
-
-// Shanghai timestamp بدون مكتبات إضافية
 function shanghaiTimestamp() {
   // sv-SE يعطي فورمات: YYYY-MM-DD HH:mm:ss
   return new Intl.DateTimeFormat("sv-SE", {
@@ -139,7 +137,21 @@ async function postForm(url, params) {
 }
 
 /* =========================
-   AliExpress Affiliate calls
+   Telegram: send long text safely
+========================= */
+async function sendLongMessage(chatId, text, opts = {}) {
+  const MAX = 3900; // أقل من 4096 للأمان
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    const chunk = remaining.slice(0, MAX);
+    remaining = remaining.slice(MAX);
+    await bot.sendMessage(chatId, chunk, opts);
+  }
+}
+
+/* =========================
+   AliExpress Affiliate call
 ========================= */
 async function callAffiliate(method, bizParams) {
   const params = {
@@ -160,7 +172,6 @@ async function callAffiliate(method, bizParams) {
 
   const data = await postForm(AE_GATEWAY, params);
 
-  // اطبع خطأ واضح إذا موجود
   const err = data?.error_response;
   if (err) console.log("API ERROR:", sanitizeForLog(err));
 
@@ -187,7 +198,6 @@ function normalizeProducts(products) {
   return products
     .map((p) => {
       const title = p?.product_title || "بدون عنوان";
-
       const image = p?.product_main_image_url || "";
       const detailUrl = p?.product_detail_url || "";
 
@@ -206,7 +216,6 @@ function normalizeProducts(products) {
 }
 
 function formatPrice(p) {
-  // إذا USD_TO_ILS_RATE موجود، اعرض ₪
   if (String(p.currency).toUpperCase() === "USD") {
     const ils = usdToIls(p.priceVal);
     if (ils !== null) return `₪${ils.toFixed(2)} (USD ${p.priceVal})`;
@@ -307,7 +316,7 @@ bot.on("message", async (msg) => {
       sort: "LAST_VOLUME_DESC",
       target_language: "AR",
       target_currency: "USD",
-      tracking_id: TRACKING_ID,
+      tracking_id: TRACKING_ID, // إذا فاضي مش مشكلة
     });
 
     const raw = extractProducts(resp);
@@ -321,18 +330,34 @@ bot.on("message", async (msg) => {
 
     const top4 = all.slice(0, 4);
 
+    // كولاج
     const collage = await buildCollage(top4);
 
-    let caption = `🔥 أفضل 4 منتجات (الأكثر طلبًا) لبحث: ${query}\n\n`;
+    // كابتشن قصير (أقل من 1024)
+    const shortCaption =
+      `🔥 أفضل 4 منتجات (الأكثر طلبًا)\n` +
+      `🔎 البحث: ${query}\n` +
+      `📩 التفاصيل بالرسالة التالية ⬇️`;
+
+    // تفاصيل برسالة منفصلة (4096 حد أعلى)
+    let details = `🔥 نتائج البحث: ${query}\n\n`;
     top4.forEach((p, i) => {
-      caption += `${i + 1}️⃣ ${p.title}\n`;
-      caption += `💰 السعر: ${formatPrice(p)}\n`;
-      caption += `🛒 المبيعات: ${p.orders}\n`;
-      caption += `⭐ التقييم: ${p.rating}\n`;
-      caption += `🔗 الرابط: ${p.detailUrl}\n\n`;
+      details += `${["1️⃣","2️⃣","3️⃣","4️⃣"][i]} ${p.title}\n`;
+      details += `💰 السعر: ${formatPrice(p)}\n`;
+      details += `🛒 المبيعات: ${p.orders}\n`;
+      details += `⭐ التقييم: ${p.rating}\n`;
+      details += `🔗 الرابط: ${p.detailUrl}\n\n`;
     });
 
-    await bot.sendPhoto(chatId, collage, { caption });
+    // أرسل الصورة مع اسم ملف (لتقليل تحذير node-telegram-bot-api)
+    await bot.sendPhoto(
+      chatId,
+      collage,
+      { caption: shortCaption },
+      { filename: "collage.jpg", contentType: "image/jpeg" }
+    );
+
+    await sendLongMessage(chatId, details, { disable_web_page_preview: true });
   } catch (e) {
     console.error("BOT ERROR:", e?.response?.data || e?.message);
     bot.sendMessage(chatId, "صار خطأ. افتح Logs وابعتلي سطر API ERROR إذا ظهر.");
