@@ -12,13 +12,12 @@ const TelegramBot = require("node-telegram-bot-api");
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 
-// Render usually provides this, but keep PUBLIC_URL supported
 const PUBLIC_URL = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL;
 if (!PUBLIC_URL) throw new Error("Missing PUBLIC_URL (or RENDER_EXTERNAL_URL)");
 
 const AE_APP_KEY = process.env.AE_APP_KEY;
 const AE_APP_SECRET = process.env.AE_APP_SECRET;
-const TRACKING_ID = process.env.TRACKING_ID; // AliExpress Affiliate Tracking ID
+const TRACKING_ID = process.env.TRACKING_ID;
 
 if (!AE_APP_KEY || !AE_APP_SECRET) throw new Error("Missing AE_APP_KEY or AE_APP_SECRET");
 if (!TRACKING_ID) throw new Error("Missing TRACKING_ID");
@@ -32,7 +31,7 @@ const USD_TO_ILS_RATE = Number(process.env.USD_TO_ILS_RATE || "0"); // example 3
 /* =========================
    Telegram webhook server
 ========================= */
-const bot = new TelegramBot(token); // webhook mode (no polling)
+const bot = new TelegramBot(token); // webhook mode
 const WEBHOOK_PATH = `/bot${token}`;
 const PORT = Number(process.env.PORT || 10000);
 
@@ -41,13 +40,11 @@ console.log("Webhook set ✅");
 
 http
   .createServer((req, res) => {
-    // health
     if (req.method === "GET" && req.url === "/") {
       res.writeHead(200, { "Content-Type": "text/plain" });
       return res.end("OK");
     }
 
-    // webhook updates
     if (req.method === "POST" && req.url === WEBHOOK_PATH) {
       let body = "";
       req.on("data", (chunk) => (body += chunk));
@@ -143,7 +140,7 @@ function gwLabel(gw) {
 }
 
 /* =========================
-   Response extract
+   Extract response
 ========================= */
 function extractProducts(apiData) {
   const root =
@@ -184,7 +181,7 @@ function getApiErrorSummary(apiData) {
 }
 
 /* =========================
-   Keyword helper (optional)
+   Arabic -> English hint (improves results)
 ========================= */
 function arabicToEnglishHint(q) {
   const s = q.trim().toLowerCase();
@@ -201,6 +198,8 @@ function arabicToEnglishHint(q) {
     [/سماعات/g, "earbuds"],
     [/بلوتوث/g, "bluetooth"],
     [/لاسلكي/g, "wireless"],
+    [/قلم\s*حبر/g, "ink pen"],
+    [/قلم/g, "pen"],
   ];
   let out = s;
   for (const [re, rep] of map) out = out.replace(re, rep);
@@ -209,7 +208,7 @@ function arabicToEnglishHint(q) {
 }
 
 /* =========================
-   Query with fallback
+   AliExpress Product Query (fallback)
 ========================= */
 async function affiliateProductQueryWithFallback(keyword) {
   const gateways = buildGatewayList();
@@ -287,26 +286,41 @@ async function affiliateProductQueryWithFallback(keyword) {
 }
 
 /* =========================
-   Title shortener
+   Title short (NO ... / NO cut word)
 ========================= */
-function cleanTitle(title, maxLen = 60) {
+function cleanTitle(title, maxLen = 55, maxWords = 9) {
   if (!title) return "منتج";
+
   let t = String(title);
 
+  // clean
   t = t
     .replace(/[™®©]/g, "")
     .replace(/\s+/g, " ")
     .replace(/\b(Hot|New|Best|Sale|Original|202\d|Free\s*Shipping|Shipping|Discount|Top)\b/gi, "")
     .replace(/\b(For|With|And|Or|The|A|An)\b/gi, "")
     .replace(/\b(حار|جديد|الأفضل|تخفيض|عرض|أصلي|شحن\s*مجاني|توصيل|خصم)\b/gi, "")
+    .replace(/[.،,:;|/\\()[\]{}"“”'’…]/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 
-  if (t.length > maxLen) t = t.slice(0, maxLen - 1).trim() + "…";
-  return t || "منتج";
+  if (!t) return "منتج";
+
+  // limit words first
+  const words = t.split(" ").filter(Boolean);
+  const shortened = words.slice(0, maxWords).join(" ");
+
+  if (shortened.length <= maxLen) return shortened;
+
+  // cut to last space within maxLen (no ellipsis)
+  const cut = shortened.slice(0, maxLen).trim();
+  const lastSpace = cut.lastIndexOf(" ");
+  if (lastSpace > 15) return cut.slice(0, lastSpace).trim();
+  return cut;
 }
 
 /* =========================
-   Currency + rating
+   Currency + rating helpers
 ========================= */
 function numFromAny(x) {
   if (x === null || x === undefined) return null;
@@ -336,10 +350,7 @@ function ratingTo5(raw) {
   const n = numFromAny(raw);
   if (!Number.isFinite(n)) return null;
 
-  // if percent 0..100
-  if (n > 5 && n <= 100) return Math.round((n / 20) * 10) / 10;
-
-  // already 0..5
+  if (n > 5 && n <= 100) return Math.round((n / 20) * 10) / 10; // 98 => 4.9
   if (n >= 0 && n <= 5) return Math.round(n * 10) / 10;
 
   return null;
@@ -372,7 +383,7 @@ function normalizeProducts(rawProducts, query) {
   return rawProducts
     .map((p) => {
       const title = p?.product_title || p?.title || "منتج";
-      const shortTitle = cleanTitle(title, 60);
+      const shortTitle = cleanTitle(title, 55, 9);
 
       const image =
         p?.product_main_image_url ||
@@ -464,11 +475,11 @@ function extractPromotionLinks(apiData) {
    Collage 2x2 (NO TEXT) + smaller numbers
 ========================= */
 function numberBadgeSVG(num) {
-  // أصغر من قبل
+  // أصغر قليلًا
   return `
-  <svg width="90" height="90">
-    <circle cx="45" cy="45" r="38" fill="#ff5a2a"/>
-    <text x="45" y="60" font-size="46" text-anchor="middle"
+  <svg width="78" height="78">
+    <circle cx="39" cy="39" r="33" fill="#ff5a2a"/>
+    <text x="39" y="52" font-size="40" text-anchor="middle"
           fill="#ffffff" font-family="Arial" font-weight="800">${num}</text>
   </svg>`;
 }
@@ -505,7 +516,7 @@ async function buildCollage(items) {
 
     layers.push({ input: img, left, top });
 
-    // رقم أصغر + مكانه شوي أقرب
+    // الرقم
     layers.push({
       input: Buffer.from(numberBadgeSVG(i + 1)),
       left: left + 14,
@@ -513,7 +524,7 @@ async function buildCollage(items) {
     });
   }
 
-  // خطوط فصل خفيفة
+  // فواصل بسيطة
   layers.push({
     input: Buffer.from(`
       <svg width="${SIZE}" height="${SIZE}">
@@ -529,11 +540,10 @@ async function buildCollage(items) {
 }
 
 /* =========================
-   Caption builder
+   Caption (NO "أفضل 4..." / NO "الرابط:")
 ========================= */
 function buildCaption(query, items) {
-  let msg = `🔥 أفضل 4 منتجات (الأكثر طلبًا)\n`;
-  msg += `🔎 البحث: ${query}\n\n`;
+  let msg = `🔎 البحث: ${query}\n\n`;
 
   items.forEach((p, i) => {
     const link = p.affiliateLink || p.detailUrl || "—";
@@ -544,7 +554,7 @@ function buildCaption(query, items) {
     msg += `💰 السعر: ${priceText}\n`;
     msg += `🛒 المبيعات: ${p.orders}\n`;
     msg += `⭐ التقييم: ${ratingText}\n`;
-    msg += `🔗 الرابط: ${link}\n\n`;
+    msg += `${link}\n\n`; // فقط الرابط
   });
 
   return msg.trim();
@@ -562,7 +572,6 @@ bot.onText(/\/start/, (msg) => {
 
 function parseQuery(text) {
   const t = (text || "").trim();
-  // supports: ابحث عن / ابحث لي عن / ابحث
   const cleaned = t
     .replace(/^\s*ابحث(\s+لي)?\s+عن\s+/i, "")
     .replace(/^\s*ابحث\s+/i, "")
@@ -585,14 +594,13 @@ bot.on("message", async (msg) => {
 
     const normAll = normalizeProducts(rawProducts, query);
 
-    // فلترة صلة (لو ما كفت، نخفف)
+    // فلترة صلة (ولو ما كفت نخفف)
     let candidates = normAll.filter((p) => p.rel >= 2);
     if (candidates.length < 4) candidates = normAll;
 
     // ترتيب: صلة ثم مبيعات
     candidates.sort((a, b) => (b.rel - a.rel) || (b.orders - a.orders));
 
-    // خذ 4
     const top4 = candidates.slice(0, 4);
 
     console.log(
@@ -603,7 +611,7 @@ bot.on("message", async (msg) => {
       return bot.sendMessage(chatId, "ما لقيت 4 نتائج مناسبة. جرّب كلمة ثانية 🙂");
     }
 
-    // Affiliate links
+    // affiliate links
     const urls = top4.map((p) => p.detailUrl).filter(Boolean);
     if (urls.length) {
       const linkData = await affiliateLinkGenerate(urls);
