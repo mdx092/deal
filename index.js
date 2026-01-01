@@ -24,27 +24,29 @@ if (!TRACKING_ID) throw new Error("Missing TRACKING_ID");
 
 const DEBUG = String(process.env.DEBUG || "").trim() === "1";
 
-// تحويل العملات (ضعها في Render Environment)
+// تحويل عملات اختياري (ضعها في Render Env)
 const CNY_TO_ILS_RATE = Number(process.env.CNY_TO_ILS_RATE || "0"); // مثال 0.52
 const USD_TO_ILS_RATE = Number(process.env.USD_TO_ILS_RATE || "0"); // مثال 3.7
 
 /* =========================
-   Telegram: Webhook mode + Health port
+   Telegram: Webhook mode
    ========================= */
-const bot = new TelegramBot(token); // webhook mode (no polling)
+const bot = new TelegramBot(token); // no polling
 const WEBHOOK_PATH = `/bot${token}`;
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT || 3000;
 
 bot.setWebHook(`${PUBLIC_URL}${WEBHOOK_PATH}`);
 console.log("Webhook set ✅");
 
 http
   .createServer((req, res) => {
+    // health
     if (req.method === "GET" && req.url === "/") {
       res.writeHead(200, { "Content-Type": "text/plain" });
       return res.end("OK");
     }
 
+    // webhook updates
     if (req.method === "POST" && req.url === WEBHOOK_PATH) {
       let body = "";
       req.on("data", (chunk) => (body += chunk));
@@ -67,10 +69,8 @@ http
   })
   .listen(PORT, () => console.log("Server listening on", PORT));
 
-console.log("Deals48 bot running (webhook mode)...");
-
 /* =========================
-   TOP helpers
+   Helpers (sign + log)
    ========================= */
 function topTimestamp() {
   const d = new Date();
@@ -92,10 +92,11 @@ function signTopMd5(params, secret) {
 }
 
 function sanitizeForLog(obj) {
-  const s = JSON.stringify(obj);
+  const s = typeof obj === "string" ? obj : JSON.stringify(obj);
   return s
     .replace(/"sign"\s*:\s*"[^"]+"/g, '"sign":"***"')
     .replace(/"app_key"\s*:\s*"[^"]+"/g, '"app_key":"***"')
+    .replace(/"token"\s*:\s*"[^"]+"/g, '"token":"***"')
     .slice(0, 1600);
 }
 
@@ -120,6 +121,9 @@ async function topPost(gateway, method, bizParams) {
   return res.data;
 }
 
+/* =========================
+   Gateways fallback
+   ========================= */
 function buildGatewayList() {
   const envGw = (process.env.AE_GATEWAY || "").trim();
   const list = [
@@ -139,7 +143,7 @@ function gwLabel(gw) {
 }
 
 /* =========================
-   AliExpress parsing
+   Extract response
    ========================= */
 function extractProducts(apiData) {
   const root =
@@ -161,83 +165,86 @@ function getApiErrorSummary(apiData) {
   const root = apiData || {};
   const err =
     root?.error_response ||
+    root?.errorResponse ||
     root?.resp_result?.error_response ||
-    root?.resp_result?.result?.error_response ||
+    root?.resp_result?.errorResponse ||
     null;
 
   if (err) return err;
 
-  const msg = root?.resp_result?.error_msg || root?.error_msg || null;
-  if (msg) return { message: msg };
+  const msg =
+    root?.resp_result?.error_msg ||
+    root?.resp_result?.errorMessage ||
+    root?.error_msg ||
+    root?.errorMessage ||
+    root?.msg ||
+    null;
 
+  if (msg) return { message: msg };
   return null;
 }
 
 /* =========================
-   Text helpers: relevance
+   Text: short + clean + 2 lines (for collage)
    ========================= */
-function normalizeTextTokens(s) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .split(/\s+/)
-    .filter((w) => w.length >= 2);
+function cleanTitle(title, maxLen = 46) {
+  if (!title) return "منتج";
+  let t = String(title);
+
+  // إزالة رموز وحشو شائع
+  t = t
+    .replace(/[™®©]/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/\b(Hot|New|Best|Sale|Original|202\d|Free\s*Shipping|Shipping|Discount|Top)\b/gi, "")
+    .replace(/\b(For|With|And|Or|The|A|An)\b/gi, "")
+    .replace(/\b(حار|جديد|الأفضل|تخفيض|عرض|أصلي|شحن\s*مجاني|توصيل|خصم)\b/gi, "")
+    .trim();
+
+  // قص نهائي
+  if (t.length > maxLen) t = t.slice(0, maxLen - 1).trim() + "…";
+  return t || "منتج";
 }
 
-function relevanceScore(query, title) {
-  const qTokens = normalizeTextTokens(query);
-  const t = String(title || "").toLowerCase();
+function wrapTwoLines(text, maxCharsPerLine = 22) {
+  const words = String(text || "").split(/\s+/).filter(Boolean);
+  const lines = [];
+  let cur = "";
 
-  if (qTokens.length === 0) return 0;
-
-  let score = 0;
-  const uniq = new Set(qTokens);
-  for (const w of uniq) {
-    if (t.includes(w)) score += 2;
+  for (const w of words) {
+    const next = cur ? `${cur} ${w}` : w;
+    if (next.length <= maxCharsPerLine) {
+      cur = next;
+    } else {
+      if (cur) lines.push(cur);
+      cur = w;
+      if (lines.length === 2) break;
+    }
   }
-  // بونس للكلمة الأولى
-  if (qTokens[0] && t.includes(qTokens[0])) score += 2;
+  if (cur && lines.length < 2) lines.push(cur);
 
-  return score;
+  // لو كلمة واحدة طويلة جدًا
+  if (lines.length === 0 && text) lines.push(String(text).slice(0, maxCharsPerLine));
+
+  // قص كل سطر إذا لزم
+  return lines.map((l) => (l.length > maxCharsPerLine ? l.slice(0, maxCharsPerLine - 1) + "…" : l));
 }
 
-// تحويل بسيط لكلمات عربية شائعة إلى إنجليزي للمساعدة
-function arabicToEnglishHint(q) {
-  const s = q.trim().toLowerCase();
-  const map = [
-    [/شاحن\s*65w/g, "65w charger"],
-    [/65\s*واط/g, "65w"],
-    [/100\s*واط/g, "100w"],
-    [/شاحن/g, "charger"],
-    [/باور\s*بانك/g, "power bank"],
-    [/بنك\s*طاقة/g, "power bank"],
-    [/ساعة\s*ذكية/g, "smartwatch"],
-    [/ساعة/g, "watch"],
-    [/سماعات/g, "earbuds"],
-    [/سماعة/g, "earbuds"],
-  ];
-
-  let out = s;
-  for (const [re, rep] of map) out = out.replace(re, rep);
-  if (out === s) return null;
-  return out;
+function escapeXml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 /* =========================
-   Price + rating formatting
+   Currency + rating helpers
    ========================= */
 function numFromAny(x) {
   if (x === null || x === undefined) return null;
   const m = String(x).match(/(\d+(\.\d+)?)/);
   return m ? Number(m[1]) : null;
-}
-
-function currencyGuessFromPriceString(s) {
-  const str = String(s || "").toUpperCase();
-  if (str.includes("US") || str.includes("USD")) return "USD";
-  if (str.includes("CNY") || str.includes("￥") || str.includes("RMB")) return "CNY";
-  if (str.includes("₪") || str.includes("ILS")) return "ILS";
-  return "";
 }
 
 function priceToILS(priceNum, currency) {
@@ -251,12 +258,10 @@ function priceToILS(priceNum, currency) {
   return null;
 }
 
-function formatPriceILS(priceNum, currency, originalStr) {
+function formatPriceILS(priceNum, currency) {
   const ils = priceToILS(priceNum, currency);
   if (ils !== null) return `₪${ils.toFixed(2)}`;
-
-  // fallback: اعرض الأصل لو ما في تحويل
-  if (priceNum === null) return originalStr ? String(originalStr) : "—";
+  if (priceNum === null || priceNum === undefined) return "—";
   return `${currency || ""} ${priceNum}`;
 }
 
@@ -264,16 +269,37 @@ function ratingTo5(raw) {
   const n = numFromAny(raw);
   if (!Number.isFinite(n)) return null;
 
-  // لو جاي كنسبة (0-100)
-  if (n > 5 && n <= 100) return Math.round((n / 20) * 10) / 10; // 98 -> 4.9
-  // لو جاي بالفعل 0-5
+  // نسبة 0-100 => حولها لـ 0-5
+  if (n > 5 && n <= 100) return Math.round((n / 20) * 10) / 10;
+
+  // بالفعل 0-5
   if (n >= 0 && n <= 5) return Math.round(n * 10) / 10;
 
   return null;
 }
 
 /* =========================
-   Product query with fallback
+   Relevance (simple)
+   ========================= */
+function relevanceScore(query, title) {
+  const q = String(query || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 2);
+
+  const t = String(title || "").toLowerCase();
+
+  let score = 0;
+  for (const w of new Set(q)) {
+    if (t.includes(w)) score += 2;
+  }
+  if (q.length && t.includes(q[0])) score += 3;
+  return score;
+}
+
+/* =========================
+   AliExpress: Query with fallback
    ========================= */
 async function affiliateProductQueryWithFallback(keyword) {
   const gateways = buildGatewayList();
@@ -296,12 +322,6 @@ async function affiliateProductQueryWithFallback(keyword) {
   attempts.push({ kw: keyword, withFields: true });
   attempts.push({ kw: keyword, withFields: false });
 
-  const en = arabicToEnglishHint(keyword);
-  if (en) {
-    attempts.push({ kw: en, withFields: true });
-    attempts.push({ kw: en, withFields: false });
-  }
-
   let lastInfo = null;
 
   for (const gateway of gateways) {
@@ -309,7 +329,7 @@ async function affiliateProductQueryWithFallback(keyword) {
       const biz = {
         keywords: a.kw,
         page_no: 1,
-        page_size: 60,
+        page_size: 50,
         sort: "LAST_VOLUME_DESC",
         target_language: "AR",
         target_currency: "USD",
@@ -351,70 +371,73 @@ async function affiliateProductQueryWithFallback(keyword) {
 }
 
 /* =========================
-   Normalize products + better ranking
+   Normalize products (adds shortTitle + 2 lines)
    ========================= */
-function normalizeProduct(p, query) {
-  const title = p?.product_title || p?.title || "منتج";
+function normalizeProducts(rawProducts, query) {
+  return rawProducts
+    .map((p) => {
+      const title = p?.product_title || p?.title || "منتج";
+      const shortTitle = cleanTitle(title, 46);
+      const titleLines = wrapTwoLines(shortTitle, 22);
 
-  const priceStr =
-    p?.app_sale_price ||
-    p?.sale_price ||
-    p?.original_price ||
-    p?.target_app_sale_price ||
-    p?.target_sale_price ||
-    "";
+      const image =
+        p?.product_main_image_url ||
+        p?.product_main_image ||
+        p?.product_small_image_urls?.string?.[0] ||
+        p?.product_small_image_urls?.[0] ||
+        p?.image_url ||
+        "";
 
-  const priceNum = numFromAny(priceStr);
+      const detailUrl = p?.product_detail_url || p?.product_url || p?.url || "";
 
-  const currency =
-    p?.app_sale_price_currency ||
-    p?.sale_price_currency ||
-    p?.original_price_currency ||
-    p?.target_app_sale_price_currency ||
-    p?.target_sale_price_currency ||
-    currencyGuessFromPriceString(priceStr) ||
-    "";
+      const priceRaw =
+        p?.app_sale_price ||
+        p?.sale_price ||
+        p?.original_price ||
+        p?.target_app_sale_price ||
+        p?.target_sale_price ||
+        "";
 
-  const ordersNumber = Number(
-    p?.lastest_volume ?? p?.last_volume ?? p?.volume ?? p?.sales_count ?? 0
-  ) || 0;
+      const priceNum = numFromAny(priceRaw);
 
-  const ratingRaw = p?.evaluate_rate || p?.avg_evaluate_rate || p?.rating || null;
-  const rating5 = ratingTo5(ratingRaw);
+      const currency =
+        p?.app_sale_price_currency ||
+        p?.sale_price_currency ||
+        p?.original_price_currency ||
+        p?.target_app_sale_price_currency ||
+        p?.target_sale_price_currency ||
+        // fallback بسيط
+        (String(priceRaw).includes("US") ? "USD" : "CNY");
 
-  const image =
-    p?.product_main_image_url ||
-    p?.product_main_image ||
-    p?.product_small_image_urls?.string?.[0] ||
-    p?.product_small_image_urls?.[0] ||
-    p?.image_url ||
-    "";
+      const orders = Number(p?.lastest_volume ?? p?.last_volume ?? p?.volume ?? p?.sales_count ?? 0) || 0;
 
-  const detailUrl = p?.product_detail_url || p?.product_url || p?.url || "";
+      const ratingRaw = p?.evaluate_rate || p?.avg_evaluate_rate || p?.rating || null;
+      const rating5 = ratingTo5(ratingRaw);
 
-  const rel = relevanceScore(query, title);
+      const rel = relevanceScore(query, title);
 
-  return {
-    title,
-    priceStr: String(priceStr || ""),
-    priceNum,
-    currency,
-    ordersNumber,
-    rating5,
-    ratingRaw,
-    image,
-    detailUrl,
-    affiliateLink: "",
-    rel,
-  };
+      return {
+        title,
+        shortTitle,
+        titleLines,
+        image,
+        detailUrl,
+        priceNum,
+        currency,
+        orders,
+        rating5,
+        rel,
+        affiliateLink: "",
+      };
+    })
+    .filter((x) => x.image && x.detailUrl);
 }
 
 /* =========================
-   Affiliate link generate
+   Link Generate (affiliate) - optional
    ========================= */
 async function affiliateLinkGenerate(sourceUrls) {
   const gateways = buildGatewayList();
-
   for (const gateway of gateways) {
     try {
       const data = await topPost(gateway, "aliexpress.affiliate.link.generate", {
@@ -424,13 +447,14 @@ async function affiliateLinkGenerate(sourceUrls) {
       });
       return data;
     } catch (e) {
-      if (DEBUG) console.error("link.generate failed:", gwLabel(gateway), e?.message);
+      console.error("link.generate failed:", gwLabel(gateway), e?.message);
     }
   }
   return null;
 }
 
 function extractPromotionLinks(apiData) {
+  if (!apiData) return [];
   const root =
     apiData?.aliexpress_affiliate_link_generate_response ||
     apiData?.aliexpress_affiliate_link_generate_resp ||
@@ -445,7 +469,7 @@ function extractPromotionLinks(apiData) {
 }
 
 /* =========================
-   Collage
+   Collage (2x2) + TITLE OVERLAY
    ========================= */
 function numberBadgeSVG(num) {
   return `
@@ -453,6 +477,33 @@ function numberBadgeSVG(num) {
     <circle cx="60" cy="60" r="52" fill="#ff5a2a"/>
     <text x="60" y="78" font-size="64" text-anchor="middle"
           fill="#ffffff" font-family="Arial" font-weight="700">${num}</text>
+  </svg>`;
+}
+
+function titleBarSVG(lines, w, h) {
+  const l1 = escapeXml(lines?.[0] || "");
+  const l2 = escapeXml(lines?.[1] || "");
+
+  // RTL friendly
+  return `
+  <svg width="${w}" height="${h}">
+    <rect x="0" y="0" width="${w}" height="${h}" fill="#000000" opacity="0.55"/>
+    <text x="${w / 2}" y="${Math.round(h * 0.42)}"
+          font-size="${Math.round(h * 0.32)}"
+          text-anchor="middle"
+          fill="#ffffff"
+          font-family="Arial"
+          direction="rtl"
+          unicode-bidi="plaintext"
+          font-weight="700">${l1}</text>
+    <text x="${w / 2}" y="${Math.round(h * 0.80)}"
+          font-size="${Math.round(h * 0.30)}"
+          text-anchor="middle"
+          fill="#ffffff"
+          font-family="Arial"
+          direction="rtl"
+          unicode-bidi="plaintext"
+          font-weight="700">${l2}</text>
   </svg>`;
 }
 
@@ -464,6 +515,7 @@ async function fetchImageBuffer(url) {
 async function buildCollage(items) {
   const SIZE = 1000;
   const HALF = SIZE / 2;
+  const BAR_H = 140; // ارتفاع شريط العنوان لكل مربع
 
   const base = sharp({
     create: {
@@ -477,16 +529,31 @@ async function buildCollage(items) {
   const layers = [];
 
   for (let i = 0; i < 4; i++) {
-    const buf = await fetchImageBuffer(items[i].image);
-    const img = await sharp(buf).resize(HALF, HALF, { fit: "cover" }).toBuffer();
-
     const left = (i % 2) * HALF;
     const top = i < 2 ? 0 : HALF;
 
+    const buf = await fetchImageBuffer(items[i].image);
+
+    // جزء الصورة (بدون شريط العنوان)
+    const img = await sharp(buf)
+      .resize(HALF, HALF - BAR_H, { fit: "cover" })
+      .toBuffer();
+
     layers.push({ input: img, left, top });
-    layers.push({ input: Buffer.from(numberBadgeSVG(i + 1)), left: left + 20, top: top + 20 });
+
+    // شريط العنوان أسفل كل مربع
+    const bar = Buffer.from(titleBarSVG(items[i].titleLines, HALF, BAR_H));
+    layers.push({ input: bar, left, top: top + (HALF - BAR_H) });
+
+    // رقم المنتج
+    layers.push({
+      input: Buffer.from(numberBadgeSVG(i + 1)),
+      left: left + 20,
+      top: top + 20,
+    });
   }
 
+  // فواصل بسيطة
   layers.push({
     input: Buffer.from(`
       <svg width="${SIZE}" height="${SIZE}">
@@ -502,22 +569,20 @@ async function buildCollage(items) {
 }
 
 /* =========================
-   Caption builder
+   Caption
    ========================= */
-function buildCaption(query, items, usedKeyword) {
+function buildCaption(query, items) {
   let msg = `🔥 أفضل 4 منتجات (الأكثر طلبًا)\n`;
-  msg += `🔎 البحث: ${query}\n`;
-  if (usedKeyword && usedKeyword !== query) msg += `➡️ تم البحث أيضًا بـ: ${usedKeyword}\n`;
-  msg += `\n`;
+  msg += `🔎 البحث: ${query}\n\n`;
 
   items.forEach((p, i) => {
     const link = p.affiliateLink || p.detailUrl || "—";
-    const priceText = formatPriceILS(p.priceNum, p.currency, p.priceStr);
+    const priceText = formatPriceILS(p.priceNum, p.currency);
     const ratingText = p.rating5 ? `${p.rating5}/5` : "—";
 
-    msg += `${i + 1}️⃣ ${p.title}\n`;
+    msg += `${i + 1}️⃣ ${p.shortTitle}\n`;
     msg += `💰 السعر: ${priceText}\n`;
-    msg += `🛒 المبيعات: ${p.ordersNumber}\n`;
+    msg += `🛒 المبيعات: ${p.orders}\n`;
     msg += `⭐ التقييم: ${ratingText}\n`;
     msg += `🔗 الرابط: ${link}\n\n`;
   });
@@ -531,7 +596,7 @@ function buildCaption(query, items, usedKeyword) {
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "أهلًا 👋\nاكتب مثلًا:\nابحث عن ساعة ذكية\nابحث عن شاحن 65W\n\n✅ النتائج الآن تكون مرتبطة بالطلب + السعر ₪ + التقييم /5"
+    "أهلًا 👋\nاكتب مثلًا:\nابحث عن ساعة ذكية\nابحث لي عن شاحن 65W"
   );
 });
 
@@ -550,39 +615,28 @@ bot.on("message", async (msg) => {
   try {
     bot.sendChatAction(chatId, "upload_photo");
 
-    const { products: rawProducts, usedKeyword, gateway } =
-      await affiliateProductQueryWithFallback(query);
+    const { products: rawProducts, gateway } = await affiliateProductQueryWithFallback(query);
 
-    // Normalize
-    const normalizedAll = rawProducts
-      .map((p) => normalizeProduct(p, query))
-      .filter((x) => x.image && x.detailUrl);
+    // Normalize + relevance filter
+    const normAll = normalizeProducts(rawProducts, query);
 
-    // فلترة الصلة
-    const qTokens = normalizeTextTokens(query);
-    const minRel = qTokens.length >= 2 ? 2 : 1;
+    // فلترة: نفضّل المرتبط بالطلب + أعلى مبيعات
+    let candidates = normAll.filter((p) => p.rel >= 2);
+    if (candidates.length < 4) candidates = normAll; // لو ما كفا، نخفف الفلتر
 
-    let candidates = normalizedAll.filter((p) => p.rel >= minRel);
-
-    // لو الفلترة شدّت كثير وما صار عندك 4، خففها (fallback)
-    if (candidates.length < 4) candidates = normalizedAll;
-
-    // ترتيب: أولًا الصلة، ثم المبيعات
-    candidates.sort((a, b) => (b.rel - a.rel) || (b.ordersNumber - a.ordersNumber));
+    candidates.sort((a, b) => (b.rel - a.rel) || (b.orders - a.orders));
 
     const top4 = candidates.slice(0, 4);
 
-    if (DEBUG) {
-      console.log(
-        `rawProducts: ${rawProducts.length} normalized: ${normalizedAll.length} candidates: ${candidates.length} (gw=${gwLabel(gateway)})`
-      );
-    }
+    console.log(
+      `rawProducts: ${rawProducts.length} normalized: ${normAll.length} top4: ${top4.length} (gw=${gwLabel(gateway)})`
+    );
 
     if (top4.length < 4) {
       return bot.sendMessage(chatId, "ما لقيت 4 نتائج مناسبة. جرّب كلمة ثانية 🙂");
     }
 
-    // Affiliate links
+    // Affiliate links (اختياري)
     const urls = top4.map((p) => p.detailUrl).filter(Boolean);
     if (urls.length) {
       const linkData = await affiliateLinkGenerate(urls);
@@ -599,11 +653,13 @@ bot.on("message", async (msg) => {
     }
 
     const collage = await buildCollage(top4);
-    const caption = buildCaption(query, top4, usedKeyword);
+    const caption = buildCaption(query, top4);
 
     await bot.sendPhoto(chatId, collage, { caption });
   } catch (err) {
-    console.error("BOT ERROR:", err?.response?.data || err.message);
+    console.error("BOT ERROR:", sanitizeForLog(err?.response?.data || err.message));
     bot.sendMessage(chatId, "صار خطأ 😅 جرّب مرة ثانية.");
   }
 });
+
+console.log("Deals48 bot running (webhook mode)...");
