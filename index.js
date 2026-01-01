@@ -6,9 +6,9 @@ const sharp = require("sharp");
 const http = require("http");
 const TelegramBot = require("node-telegram-bot-api");
 
-/* =========================================================
+/* =========================
    ENV
-   ========================================================= */
+   ========================= */
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 
@@ -21,34 +21,49 @@ const AE_APP_SECRET = process.env.AE_APP_SECRET;
 const TRACKING_ID = process.env.TRACKING_ID;
 
 if (!AE_APP_KEY || !AE_APP_SECRET) throw new Error("Missing AE_APP_KEY or AE_APP_SECRET");
-if (!TRACKING_ID) throw new Error("Missing TRACKING_ID (required for affiliate links)");
+if (!TRACKING_ID) throw new Error("Missing TRACKING_ID");
 
-/* =========================================================
-   Telegram: Webhook mode (no polling)
-   ========================================================= */
-const bot = new TelegramBot(token); // ✅ no polling
+/**
+ * لأن AliExpress Affiliate API لا يدعم ILS كـ target_currency،
+ * سنطلب USD ثم نحول لشيكل تقريبًا
+ * ضع القيمة في Render → Environment مثل: 3.7 (حسب سعر اليوم)
+ */
+const USD_TO_ILS_RATE = Number(process.env.USD_TO_ILS_RATE || "0"); // 0 = بدون تحويل
+
+function usdToIls(usdStr) {
+  const usd = Number(String(usdStr).replace(/[^\d.]/g, ""));
+  if (!Number.isFinite(usd) || usd <= 0) return null;
+  if (!USD_TO_ILS_RATE || USD_TO_ILS_RATE <= 0) return null;
+  const ils = usd * USD_TO_ILS_RATE;
+  return ils;
+}
+
+/* =========================
+   Telegram: Webhook mode
+   ========================= */
+const bot = new TelegramBot(token); // no polling
 const WEBHOOK_PATH = `/bot${token}`;
 const PORT = process.env.PORT || 3000;
 
-// Set webhook
 bot.setWebHook(`${PUBLIC_URL}${WEBHOOK_PATH}`);
 console.log("Webhook set ✅");
 
-// HTTP server: health + webhook receiver
 http
   .createServer((req, res) => {
+    // health
     if (req.method === "GET" && req.url === "/") {
       res.writeHead(200, { "Content-Type": "text/plain" });
       return res.end("OK");
     }
 
+    // webhook updates
     if (req.method === "POST" && req.url === WEBHOOK_PATH) {
       let body = "";
       req.on("data", (chunk) => (body += chunk));
       req.on("end", () => {
         try {
           const update = JSON.parse(body);
-          // Debug (اختياري): تأكد وصول التحديثات
+          // فعّل هذا مؤقتًا إذا بدك تتأكد من وصول التحديثات:
           // console.log("Incoming update ✅", update?.update_id);
           bot.processUpdate(update);
         } catch (e) {
@@ -65,9 +80,9 @@ http
   })
   .listen(PORT, () => console.log("Server listening on", PORT));
 
-/* =========================================================
-   TOP / AliExpress Official API helpers
-   ========================================================= */
+/* =========================
+   TOP helpers
+   ========================= */
 function topTimestamp() {
   const d = new Date();
   const p = (n) => String(n).padStart(2, "0");
@@ -108,15 +123,31 @@ async function topPost(method, bizParams) {
   return res.data;
 }
 
-/* =========================================================
-   AliExpress Affiliate: Product Query (highest sales)
-   ========================================================= */
+/* =========================
+   AliExpress: Product Query
+   ========================= */
 async function affiliateProductQuery(keyword) {
+  // fields مهم جدًا حتى يضمن يرجّع الصورة + الرابط + السعر + المبيعات
+  const fields = [
+    "product_title",
+    "product_main_image_url",
+    "product_detail_url",
+    "app_sale_price",
+    "app_sale_price_currency",
+    "sale_price",
+    "sale_price_currency",
+    "original_price",
+    "original_price_currency",
+    "lastest_volume",
+    "evaluate_rate",
+  ].join(",");
+
   return topPost("aliexpress.affiliate.product.query", {
     keywords: keyword,
     page_no: 1,
     page_size: 50,
-    sort: "LAST_VOLUME_DESC", // أعلى مبيعات
+    sort: "LAST_VOLUME_DESC",
+    fields, // ✅
     target_language: "AR",
     target_currency: "USD",
     ship_to_country: "IL",
@@ -156,6 +187,7 @@ function normalizeProducts(products) {
       const currency =
         p?.app_sale_price_currency ||
         p?.sale_price_currency ||
+        p?.original_price_currency ||
         p?.target_app_sale_price_currency ||
         p?.target_sale_price_currency ||
         "USD";
@@ -179,7 +211,7 @@ function normalizeProducts(products) {
       return {
         title,
         priceVal: String(priceVal),
-        currency,
+        currency: String(currency),
         ordersNumber,
         rating: String(rating),
         image,
@@ -187,13 +219,13 @@ function normalizeProducts(products) {
         affiliateLink: "",
       };
     })
-    .filter((x) => x.image) // ✅ أهم شيء: الصورة فقط
-    .sort((a, b) => b.ordersNumber - a.ordersNumber); // احتياط
+    .filter((x) => x.image) // ✅ شرطنا الوحيد الآن: صورة
+    .sort((a, b) => b.ordersNumber - a.ordersNumber);
 }
 
-/* =========================================================
-   AliExpress Affiliate: Link Generate (affiliate links)
-   ========================================================= */
+/* =========================
+   AliExpress: Link Generate
+   ========================= */
 async function affiliateLinkGenerate(sourceUrls) {
   return topPost("aliexpress.affiliate.link.generate", {
     promotion_link_type: 0,
@@ -216,9 +248,9 @@ function extractPromotionLinks(apiData) {
   return Array.isArray(arr) ? arr : [];
 }
 
-/* =========================================================
-   Collage (2x2) + numbered badges
-   ========================================================= */
+/* =========================
+   Collage (2x2) + numbers
+   ========================= */
 function numberBadgeSVG(num) {
   return `
   <svg width="120" height="120">
@@ -263,7 +295,6 @@ async function buildCollage(items) {
     });
   }
 
-  // separators
   layers.push({
     input: Buffer.from(`
       <svg width="${SIZE}" height="${SIZE}">
@@ -278,12 +309,22 @@ async function buildCollage(items) {
   return base.composite(layers).jpeg({ quality: 85 }).toBuffer();
 }
 
+function formatPriceLine(p) {
+  // لو في تحويل، اعرض ₪ + (USD)
+  const ils = usdToIls(p.priceVal);
+  if (p.currency.toUpperCase() === "USD" && ils !== null) {
+    return `₪${ils.toFixed(2)} (USD ${p.priceVal})`;
+  }
+  // غير ذلك: اعرض العملة كما هي
+  return `${p.currency} ${p.priceVal}`;
+}
+
 function buildCaption(query, items) {
   let msg = `🔥 أفضل 4 منتجات (الأكثر طلبًا) لبحث: ${query}\n\n`;
   items.forEach((p, i) => {
     const link = p.affiliateLink || p.detailUrl || "—";
     msg += `${i + 1}️⃣ ${p.title}\n`;
-    msg += `💰 السعر: ${p.currency} ${p.priceVal}\n`;
+    msg += `💰 السعر: ${formatPriceLine(p)}\n`;
     msg += `🛒 المبيعات: ${p.ordersNumber}\n`;
     msg += `⭐ التقييم: ${p.rating}\n`;
     msg += `🔗 الرابط: ${link}\n\n`;
@@ -292,18 +333,17 @@ function buildCaption(query, items) {
   return msg;
 }
 
-/* =========================================================
+/* =========================
    Telegram handlers
-   ========================================================= */
+   ========================= */
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "أهلًا 👋\nاكتب مثلًا:\nابحث عن ساعة ذكية\nابحث لي عن شاحن 65W"
+    "أهلًا 👋\nاكتب مثلًا:\nابحث عن ساعة\nابحث عن شاحن 65W\nابحث لي عن سماعات"
   );
 });
 
 function parseQuery(text) {
-  // يقبل: "ابحث عن ..." و "ابحث لي عن ..."
   return text.replace(/^\s*ابحث(\s+لي)?\s+عن\s+/i, "").trim();
 }
 
@@ -318,18 +358,24 @@ bot.on("message", async (msg) => {
   try {
     bot.sendChatAction(chatId, "upload_photo");
 
-    // 1) products (sorted by sales)
     const productData = await affiliateProductQuery(query);
     const rawProducts = extractProducts(productData);
 
     const all = normalizeProducts(rawProducts);
+
+    // تشخيص بسيط (يمكنك إلغاءه لاحقًا)
+    console.log("rawProducts:", rawProducts.length, "withImage:", all.length);
+
     if (all.length < 4) {
-      return bot.sendMessage(chatId, "ما لقيت 4 منتجات بصور. جرّب كلمة ثانية 🙂");
+      return bot.sendMessage(
+        chatId,
+        "ما لقيت نتائج كافية. جرّب كلمة أبسط مثل: شاحن / سماعات / ساعة (وأحيانًا الإنجليزي يعطي نتائج أكثر). 🙂"
+      );
     }
 
     const top4 = all.slice(0, 4);
 
-    // 2) Generate affiliate links only for items with detailUrl
+    // Generate affiliate links only when we have detailUrl
     const urls = top4.map((p) => p.detailUrl).filter(Boolean);
 
     if (urls.length) {
@@ -353,7 +399,6 @@ bot.on("message", async (msg) => {
       }
     }
 
-    // 3) collage + caption
     const collage = await buildCollage(top4);
     const caption = buildCaption(query, top4);
 
@@ -362,7 +407,7 @@ bot.on("message", async (msg) => {
     console.error(err?.response?.data || err.message);
     bot.sendMessage(
       chatId,
-      "صار خطأ 😅\nإذا تكرر، ابعث آخر 20 سطر من Logs (بدون أسرار) عشان نحدد سبب API."
+      "صار خطأ 😅\nإذا تكرر، ابعث آخر 20 سطر من Logs (بدون أي أسرار) لنحدد سبب الاستجابة من API."
     );
   }
 });
