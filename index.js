@@ -24,9 +24,9 @@ if (!TRACKING_ID) throw new Error("Missing TRACKING_ID");
 
 const DEBUG = String(process.env.DEBUG || "").trim() === "1";
 
-// Optional currency rates (set in Render Env)
-const CNY_TO_ILS_RATE = Number(process.env.CNY_TO_ILS_RATE || "0"); // example 0.52
-const USD_TO_ILS_RATE = Number(process.env.USD_TO_ILS_RATE || "0"); // example 3.7
+// Optional currency rates (Render Env)
+const CNY_TO_ILS_RATE = Number(process.env.CNY_TO_ILS_RATE || "0"); // ex 0.52
+const USD_TO_ILS_RATE = Number(process.env.USD_TO_ILS_RATE || "0"); // ex 3.7
 
 /* =========================
    Telegram webhook server
@@ -128,7 +128,6 @@ function buildGatewayList() {
     "https://eco.taobao.com/router/rest",
     "https://api.taobao.com/router/rest",
   ].filter(Boolean);
-
   return [...new Set(list)];
 }
 
@@ -189,7 +188,8 @@ function arabicToEnglishHint(q) {
     [/شاحن\s*65w/g, "65w charger"],
     [/65\s*واط/g, "65w"],
     [/100\s*واط/g, "100w"],
-    [/شاحن/g, "charger"],
+    [/شاحن/g, "charger adapter pd"],
+    [/محول/g, "adapter"],
     [/كابل/g, "cable"],
     [/باور\s*بانك/g, "power bank"],
     [/بنك\s*طاقة/g, "power bank"],
@@ -198,8 +198,6 @@ function arabicToEnglishHint(q) {
     [/سماعات/g, "earbuds"],
     [/بلوتوث/g, "bluetooth"],
     [/لاسلكي/g, "wireless"],
-    [/قلم\s*حبر/g, "ink pen"],
-    [/قلم/g, "pen"],
   ];
   let out = s;
   for (const [re, rep] of map) out = out.replace(re, rep);
@@ -355,10 +353,13 @@ function ratingTo5(raw) {
 }
 
 /* =========================
-   Relevance score (simple)
+   Relevance score (Arabic + English hint)
 ========================= */
 function relevanceScore(query, title) {
-  const q = String(query || "")
+  const hint = arabicToEnglishHint(query) || "";
+  const combined = `${query} ${hint}`;
+
+  const q = String(combined)
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s]/gu, " ")
     .split(/\s+/)
@@ -380,7 +381,6 @@ function relevanceScore(query, title) {
 function extractItemIdFromUrl(url) {
   try {
     const u = String(url || "");
-    // common AliExpress item id: /item/100500xxxx.html
     const m = u.match(/\/item\/(\d+)\.html/i) || u.match(/item\/(\d+)/i);
     return m ? m[1] : null;
   } catch {
@@ -391,9 +391,8 @@ function extractItemIdFromUrl(url) {
 function normalizeImageKey(url) {
   try {
     const u = new URL(url);
-    return `${u.origin}${u.pathname}`; // drop query
+    return `${u.origin}${u.pathname}`;
   } catch {
-    // fallback: strip query manually
     return String(url || "").split("?")[0];
   }
 }
@@ -418,7 +417,6 @@ function jaccard(aTokens, bTokens) {
 }
 
 function pickTop4Unique(sortedCandidates) {
-  // Pass 1: strict (id + image + near-title similarity)
   const pass = (opts) => {
     const chosen = [];
     const seenIds = new Set();
@@ -455,18 +453,11 @@ function pickTop4Unique(sortedCandidates) {
     return chosen;
   };
 
-  // strict -> medium -> loose
   let out = pass({ checkId: true, checkImage: true, checkNearTitle: true, simThreshold: 0.82 });
-  if (out.length < 4) {
-    out = pass({ checkId: true, checkImage: true, checkNearTitle: true, simThreshold: 0.72 });
-  }
-  if (out.length < 4) {
-    out = pass({ checkId: true, checkImage: true, checkNearTitle: false, simThreshold: 0 });
-  }
-  if (out.length < 4) {
-    // last resort: take first 4
-    out = sortedCandidates.slice(0, 4);
-  }
+  if (out.length < 4) out = pass({ checkId: true, checkImage: true, checkNearTitle: true, simThreshold: 0.72 });
+  if (out.length < 4) out = pass({ checkId: true, checkImage: true, checkNearTitle: false, simThreshold: 0 });
+  if (out.length < 4) out = sortedCandidates.slice(0, 4);
+
   return out;
 }
 
@@ -541,23 +532,12 @@ function normalizeProducts(rawProducts, query) {
 }
 
 /* =========================
-   Affiliate link generate
+   Affiliate link generate (chunked) + FILTER affiliate only
 ========================= */
-async function affiliateLinkGenerate(sourceUrls) {
-  const gateways = buildGatewayList();
-  for (const gateway of gateways) {
-    try {
-      const data = await topPost(gateway, "aliexpress.affiliate.link.generate", {
-        promotion_link_type: 0,
-        source_values: sourceUrls.join(","),
-        tracking_id: TRACKING_ID,
-      });
-      return data;
-    } catch (e) {
-      console.error("link.generate failed:", gwLabel(gateway), e?.message);
-    }
-  }
-  return null;
+function chunkArray(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
 }
 
 function extractPromotionLinks(apiData) {
@@ -573,6 +553,51 @@ function extractPromotionLinks(apiData) {
     [];
 
   return Array.isArray(arr) ? arr : [];
+}
+
+async function generateAffiliateLinkMap(urls) {
+  const gateways = buildGatewayList();
+  const map = new Map();
+
+  // AliExpress sometimes fails if we send too many urls at once
+  const chunks = chunkArray(urls, 20);
+
+  for (const chunk of chunks) {
+    let data = null;
+
+    for (const gw of gateways) {
+      try {
+        data = await topPost(gw, "aliexpress.affiliate.link.generate", {
+          promotion_link_type: 0,
+          source_values: chunk.join(","),
+          tracking_id: TRACKING_ID,
+        });
+        break;
+      } catch (e) {
+        console.error("link.generate failed:", gwLabel(gw), e?.message);
+      }
+    }
+
+    if (!data) continue;
+
+    const linksArr = extractPromotionLinks(data);
+    for (const row of linksArr) {
+      const src = row?.source_value;
+      const promo = row?.promotion_link;
+      if (src && promo) map.set(src, promo);
+    }
+  }
+
+  return map;
+}
+
+async function attachAffiliateLinks(products) {
+  const urls = products.map((p) => p.detailUrl).filter(Boolean);
+  const linkMap = await generateAffiliateLinkMap(urls);
+  for (const p of products) {
+    p.affiliateLink = p.detailUrl ? (linkMap.get(p.detailUrl) || "") : "";
+  }
+  return products;
 }
 
 /* =========================
@@ -641,13 +666,12 @@ async function buildCollage(items) {
 }
 
 /* =========================
-   Caption (NO "أفضل 4..." / NO "الرابط:")
+   Caption (affiliate link only)
 ========================= */
 function buildCaption(query, items) {
   let msg = `🔎 البحث: ${query}\n\n`;
 
   items.forEach((p, i) => {
-    const link = p.affiliateLink || p.detailUrl || "—";
     const priceText = formatPriceILS(p.priceNum, p.currency);
     const ratingText = p.rating5 ? `${p.rating5}/5` : "—";
 
@@ -655,7 +679,7 @@ function buildCaption(query, items) {
     msg += `💰 السعر: ${priceText}\n`;
     msg += `🛒 المبيعات: ${p.orders}\n`;
     msg += `⭐ التقييم: ${ratingText}\n`;
-    msg += `${link}\n\n`;
+    msg += `${p.affiliateLink}\n\n`; // فقط رابط الأفلييت
   });
 
   return msg.trim();
@@ -695,40 +719,37 @@ bot.on("message", async (msg) => {
 
     const normAll = normalizeProducts(rawProducts, query);
 
-    // filter relevance if possible
+    // 1) candidates by relevance if possible
     let candidates = normAll.filter((p) => p.rel >= 2);
-    if (candidates.length < 4) candidates = normAll;
+    if (candidates.length < 10) candidates = normAll;
 
-    // sort: relevance then orders
+    // 2) sort
     candidates.sort((a, b) => (b.rel - a.rel) || (b.orders - a.orders));
 
-    // DEDUPE هنا ✅
-    const top4 = pickTop4Unique(candidates);
+    // 3) Take a pool, generate affiliate links, keep ONLY commissionable
+    //    (اول 40 ثم توسعة 80 لو ما كفت)
+    const pool1 = candidates.slice(0, 40);
+    await attachAffiliateLinks(pool1);
+    let affiliateOnly = pool1.filter((p) => p.affiliateLink);
+
+    if (affiliateOnly.length < 4) {
+      const pool2 = candidates.slice(0, 80);
+      await attachAffiliateLinks(pool2);
+      affiliateOnly = pool2.filter((p) => p.affiliateLink);
+    }
+
+    // 4) final sort + dedupe + pick 4
+    affiliateOnly.sort((a, b) => (b.rel - a.rel) || (b.orders - a.orders));
+    const top4 = pickTop4Unique(affiliateOnly);
 
     console.log(
-      `rawProducts: ${rawProducts.length} normalized: ${normAll.length} picked: ${top4.length} (gw=${gwLabel(
+      `rawProducts:${rawProducts.length} normalized:${normAll.length} affiliateOnly:${affiliateOnly.length} picked:${top4.length} (gw=${gwLabel(
         gateway
       )})`
     );
 
     if (top4.length < 4) {
-      return bot.sendMessage(chatId, "ما لقيت 4 نتائج مناسبة. جرّب كلمة ثانية 🙂");
-    }
-
-    // affiliate links
-    const urls = top4.map((p) => p.detailUrl).filter(Boolean);
-    if (urls.length) {
-      const linkData = await affiliateLinkGenerate(urls);
-      if (linkData) {
-        const linksArr = extractPromotionLinks(linkData);
-        const linkMap = new Map();
-        for (const row of linksArr) {
-          if (row?.source_value && row?.promotion_link) linkMap.set(row.source_value, row.promotion_link);
-        }
-        top4.forEach((p) => {
-          p.affiliateLink = p.detailUrl ? (linkMap.get(p.detailUrl) || "") : "";
-        });
-      }
+      return bot.sendMessage(chatId, "ما لقيت 4 منتجات عليها تسويق بالعمولة. جرّب كلمة ثانية 🙂");
     }
 
     const collage = await buildCollage(top4);
