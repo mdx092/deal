@@ -24,8 +24,10 @@ if (!TRACKING_ID) throw new Error("Missing TRACKING_ID");
 
 const DEBUG = String(process.env.DEBUG || "").trim() === "1";
 
-// ضع قيمة الدولار للشيكل في Render
+// لو target_currency رجع USD: حوّله لشيكل
 const USD_TO_ILS_RATE = Number(process.env.USD_TO_ILS_RATE || "0");
+// اختياري لو صار CNY رغم كل شيء:
+const CNY_TO_ILS_RATE = Number(process.env.CNY_TO_ILS_RATE || "0");
 
 /* =========================
    Telegram webhook server
@@ -180,12 +182,13 @@ function getApiErrorSummary(apiData) {
 }
 
 /* =========================
-   Arabic -> English hint (to improve search)
+   Arabic -> English hint (improve search)
 ========================= */
 function arabicToEnglishHint(q) {
   const s = (q || "").trim().toLowerCase();
   const map = [
     [/شاحن\s*65w/g, "65w gan charger pd"],
+    [/شاحن\s*100w/g, "100w gan charger pd"],
     [/65\s*واط/g, "65w"],
     [/100\s*واط/g, "100w"],
     [/شاحن/g, "charger pd"],
@@ -204,23 +207,29 @@ function arabicToEnglishHint(q) {
 
 /* =========================
    AliExpress Product Query (fallback)
+   ✅ Try ILS first, then USD
 ========================= */
 async function affiliateProductQueryWithFallback(keyword) {
   const gateways = buildGatewayList();
 
+  // ✅ IMPORTANT: include target_* fields to avoid CNY
   const fields = [
     "product_title",
     "product_main_image_url",
     "product_detail_url",
+    "lastest_volume",
+    "evaluate_rate",
+    "product_id",
     "app_sale_price",
     "app_sale_price_currency",
     "sale_price",
     "sale_price_currency",
     "original_price",
     "original_price_currency",
-    "lastest_volume",
-    "evaluate_rate",
-    "product_id",
+    "target_app_sale_price",
+    "target_app_sale_price_currency",
+    "target_sale_price",
+    "target_sale_price_currency",
   ].join(",");
 
   const attempts = [];
@@ -233,52 +242,67 @@ async function affiliateProductQueryWithFallback(keyword) {
     attempts.push({ kw: en, withFields: false });
   }
 
+  // ✅ Try ILS first then USD (so you get ₪ directly if supported)
+  const currencyAttempts = ["ILS", "USD"];
+
   let lastInfo = null;
 
   for (const gateway of gateways) {
-    for (const a of attempts) {
-      const biz = {
-        keywords: a.kw,
-        page_no: 1,
-        page_size: 50,
-        sort: "LAST_VOLUME_DESC",
-        target_language: "AR",
-        target_currency: "USD",
-        ship_to_country: "IL",
-        tracking_id: TRACKING_ID,
-      };
-      if (a.withFields) biz.fields = fields;
+    for (const targetCurrency of currencyAttempts) {
+      for (const a of attempts) {
+        const biz = {
+          keywords: a.kw,
+          page_no: 1,
+          page_size: 50,
+          sort: "LAST_VOLUME_DESC",
+          target_language: "AR",
+          target_currency: targetCurrency,
+          ship_to_country: "IL",
+          tracking_id: TRACKING_ID,
+        };
+        if (a.withFields) biz.fields = fields;
 
-      let data;
-      try {
-        if (DEBUG) console.log(`API TRY -> gw=${gwLabel(gateway)} kw="${a.kw}" fields=${a.withFields}`);
-        data = await topPost(gateway, "aliexpress.affiliate.product.query", biz);
-      } catch (e) {
-        lastInfo = { gw: gwLabel(gateway), kw: a.kw, withFields: a.withFields, networkError: e?.message };
-        console.log("API NET ERR:", sanitizeForLog(lastInfo));
-        continue;
+        let data;
+        try {
+          if (DEBUG)
+            console.log(
+              `API TRY -> gw=${gwLabel(gateway)} cur=${targetCurrency} kw="${a.kw}" fields=${a.withFields}`
+            );
+          data = await topPost(gateway, "aliexpress.affiliate.product.query", biz);
+        } catch (e) {
+          lastInfo = {
+            gw: gwLabel(gateway),
+            cur: targetCurrency,
+            kw: a.kw,
+            withFields: a.withFields,
+            networkError: e?.message,
+          };
+          console.log("API NET ERR:", sanitizeForLog(lastInfo));
+          continue;
+        }
+
+        const err = getApiErrorSummary(data);
+        const products = extractProducts(data);
+
+        lastInfo = {
+          gw: gwLabel(gateway),
+          cur: targetCurrency,
+          kw: a.kw,
+          withFields: a.withFields,
+          productsCount: products.length,
+          hasError: !!err,
+          error: err || null,
+        };
+
+        if (DEBUG) console.log("API RESP (short):", sanitizeForLog(lastInfo));
+
+        if (products.length > 0) return { products, usedKeyword: a.kw, gateway, targetCurrency };
       }
-
-      const err = getApiErrorSummary(data);
-      const products = extractProducts(data);
-
-      lastInfo = {
-        gw: gwLabel(gateway),
-        kw: a.kw,
-        withFields: a.withFields,
-        productsCount: products.length,
-        hasError: !!err,
-        error: err || null,
-      };
-
-      if (DEBUG) console.log("API RESP (short):", sanitizeForLog(lastInfo));
-
-      if (products.length > 0) return { products, usedKeyword: a.kw, gateway };
     }
   }
 
   if (DEBUG) console.log("API FINAL FAIL:", sanitizeForLog(lastInfo || { note: "no_attempts" }));
-  return { products: [], usedKeyword: keyword, gateway: null };
+  return { products: [], usedKeyword: keyword, gateway: null, targetCurrency: null };
 }
 
 /* =========================
@@ -317,14 +341,18 @@ function numFromAny(x) {
 function priceToILS(priceNum, currency) {
   if (!Number.isFinite(priceNum)) return null;
   const cur = String(currency || "").toUpperCase();
+
   if (cur === "ILS") return priceNum;
   if (cur === "USD" && USD_TO_ILS_RATE > 0) return priceNum * USD_TO_ILS_RATE;
+  if (cur === "CNY" && CNY_TO_ILS_RATE > 0) return priceNum * CNY_TO_ILS_RATE;
+
   return null;
 }
 
 function formatPrice(priceNum, currency) {
   const ils = priceToILS(priceNum, currency);
   if (ils !== null) return `₪${ils.toFixed(2)}`;
+
   if (priceNum === null || priceNum === undefined) return "—";
   const cur = String(currency || "").toUpperCase() || "USD";
   return `${cur} ${Number(priceNum).toFixed(2)}`;
@@ -339,7 +367,7 @@ function ratingTo5(raw) {
 }
 
 /* =========================
-   STRONG INTENT FILTER (this makes results like competitor)
+   STRONG INTENT FILTER (better relevance)
 ========================= */
 function normText(s) {
   return String(s || "")
@@ -361,10 +389,10 @@ function extractNumberUnit(query) {
 
 function extractIntent(query) {
   const q = normText(query);
-  const wantsCharger = /\b(شاحن|charger|adapter|محول)\b/.test(q) && !/\b(كابل|cable)\b/.test(q);
-  const wantsCable = /\b(كابل|cable)\b/.test(q);
-  const wantsPowerBank = /\b(باور|power)\b/.test(q) && /\b(بانك|bank)\b/.test(q);
-  const wantsWatch = /\b(ساعة)\b/.test(q) && /\b(ذكية|smart)\b/.test(q);
+  const wantsCable = /\b(كابل|cable|سلك|wire)\b/.test(q);
+  const wantsCharger = /\b(شاحن|charger|adapter|محول)\b/.test(q) && !wantsCable;
+  const wantsPowerBank = (/\b(باور|power)\b/.test(q) && /\b(بانك|bank)\b/.test(q)) || /\b(power bank)\b/.test(q);
+  const wantsWatch = (/\b(ساعة)\b/.test(q) && /\b(ذكية|smart)\b/.test(q)) || /\b(smartwatch)\b/.test(q);
   return { wantsCharger, wantsCable, wantsPowerBank, wantsWatch };
 }
 
@@ -374,7 +402,7 @@ function titleHasWatt(title, watt) {
   const re = new RegExp(`\\b${watt}\\s*(w|واط)\\b`, "i");
   if (!re.test(t)) return false;
 
-  // ممنوع watt مختلفة إذا المستخدم طلب رقم محدد
+  // لو ظهر أكثر من وات، لازم يحتوي المطلوب
   const all = [...t.matchAll(/(\d{2,4})\s*(w|واط)\b/g)].map((m) => Number(m[1]));
   if (all.length && !all.includes(watt)) return false;
 
@@ -406,7 +434,6 @@ function minTokenMatch(title, query, minHits = 1) {
   const toks = queryTokens(query);
   if (!toks.length) return true;
 
-  // لا نحسب الأرقام كوحدة هنا لأنها تُفحص منفصلة
   const filtered = toks.filter((w) => !/^\d+$/.test(w));
   if (!filtered.length) return true;
 
@@ -418,7 +445,7 @@ function minTokenMatch(title, query, minHits = 1) {
   return false;
 }
 
-// Boost keywords (not sorting, but used to choose better candidates when results كثيرة)
+// For chargers: prefer PD/GaN/USB-C, and penalize accessories
 function chargerBoostScore(title) {
   const t = normText(title);
   let s = 0;
@@ -426,32 +453,31 @@ function chargerBoostScore(title) {
   if (/\bpd\b/.test(t) || t.includes("power delivery")) s += 2;
   if (t.includes("usb c") || t.includes("usb-c") || t.includes("type c")) s += 2;
   if (/\bqc\b/.test(t)) s += 1;
-  // يقلل فرص “kit/cover/case”
   if (t.includes("case") || t.includes("cover") || t.includes("holder") || t.includes("stand")) s -= 3;
   return s;
 }
 
+function isObviouslyAccessory(title) {
+  const banCommon = [
+    "holder","stand","dock","hub","mount","bracket","case","cover","skin","sticker",
+    "حامل","ستاند","قاعدة","كفر","جراب","غطاء","ملصق","موزع","هاب"
+  ];
+  return containsAny(title, banCommon);
+}
+
+// ✅ strong filter
 function passesStrongIntent(productTitle, query) {
   const { watt, mah } = extractNumberUnit(query);
   const intent = extractIntent(query);
   const title = productTitle || "";
 
-  // 1) مواصفات رقمية صارمة
   if (!titleHasWatt(title, watt)) return false;
   if (!titleHasMah(title, mah)) return false;
+  if (isObviouslyAccessory(title)) return false;
 
-  // 2) على الأقل تطابق كلمة من البحث (يحسن الدقة جدًا)
-  // للشواحن نطلب تطابق أقوى (minHits=2) غالباً
+  // stronger token match for charger queries
   const minHits = intent.wantsCharger ? 2 : 1;
   if (!minTokenMatch(title, query, minHits)) return false;
-
-  // 3) فلترة حسب النية + منع الاكسسوارات
-  const banCommon = [
-    "holder","stand","dock","hub","mount","bracket","case","cover","skin","sticker",
-    "حامل","ستاند","قاعدة","كفر","جراب","غطاء","ملصق","موزع","هاب"
-  ];
-
-  if (containsAny(title, banCommon)) return false;
 
   if (intent.wantsCharger) {
     const must = ["charger", "adapter", "شاحن", "محول", "gan", "pd"];
@@ -462,10 +488,7 @@ function passesStrongIntent(productTitle, query) {
 
   if (intent.wantsCable) {
     const must = ["cable", "كابل", "wire", "سلك", "usb c", "usb-c", "type c"];
-    const ban = ["charger", "شاحن", "adapter", "محول"];
     if (!containsAny(title, must)) return false;
-    // أحيانًا يكون “cable for charger” فلا نمنع بشدة هنا
-    if (containsAny(title, ban) && !containsAny(title, ["cable","كابل"])) return false;
   }
 
   if (intent.wantsPowerBank) {
@@ -477,6 +500,29 @@ function passesStrongIntent(productTitle, query) {
     const must = ["smartwatch", "watch", "ساعة", "ذكية"];
     if (!containsAny(title, must)) return false;
   }
+
+  return true;
+}
+
+// ✅ relaxed but still smart (avoid cables when user wants charger)
+function passesRelaxedButSmart(productTitle, query) {
+  const { watt, mah } = extractNumberUnit(query);
+  const intent = extractIntent(query);
+  const title = productTitle || "";
+
+  if (!titleHasWatt(title, watt)) return false;
+  if (!titleHasMah(title, mah)) return false;
+  if (isObviouslyAccessory(title)) return false;
+
+  if (intent.wantsCharger) {
+    const must = ["charger", "adapter", "شاحن", "محول", "gan", "pd"];
+    const ban = ["cable", "كابل", "wire", "سلك"];
+    if (!containsAny(title, must)) return false;
+    if (containsAny(title, ban)) return false;
+  }
+
+  // token match أخف
+  if (!minTokenMatch(title, query, 1)) return false;
 
   return true;
 }
@@ -503,73 +549,42 @@ function normalizeImageKey(url) {
   }
 }
 
-function tokenizeTitleForSimilarity(t) {
-  return String(t || "")
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .split(/\s+/)
-    .filter((w) => w.length >= 2);
-}
-
-function jaccard(aTokens, bTokens) {
-  const a = new Set(aTokens);
-  const b = new Set(bTokens);
-  if (!a.size || !b.size) return 0;
-
-  let inter = 0;
-  for (const x of a) if (b.has(x)) inter++;
-  const union = a.size + b.size - inter;
-  return union ? inter / union : 0;
+function normalizeTitleKey(t) {
+  return normText(t).replace(/\s+/g, " ").trim();
 }
 
 function pickTop4Unique(sortedCandidates) {
-  const pass = (opts) => {
-    const chosen = [];
-    const seenIds = new Set();
-    const seenImages = new Set();
-    const chosenTitleTokens = [];
+  const chosen = [];
+  const seenIds = new Set();
+  const seenImages = new Set();
+  const seenTitle = new Set();
 
-    for (const p of sortedCandidates) {
-      if (chosen.length >= 4) break;
+  for (const p of sortedCandidates) {
+    if (chosen.length >= 4) break;
 
-      const pid = p.productId || null;
-      const imgKey = p.imageKey || p.image;
+    const pid = p.productId || null;
+    const imgKey = p.imageKey || p.image || "";
+    const titleKey = normalizeTitleKey(p.shortTitle || p.title || "");
 
-      if (opts.checkId && pid && seenIds.has(pid)) continue;
-      if (opts.checkImage && imgKey && seenImages.has(imgKey)) continue;
+    if (pid && seenIds.has(pid)) continue;
+    if (imgKey && seenImages.has(imgKey)) continue;
+    if (titleKey && seenTitle.has(titleKey)) continue;
 
-      if (opts.checkNearTitle) {
-        const tok = p._titleTokens;
-        let near = false;
-        for (const prev of chosenTitleTokens) {
-          if (jaccard(tok, prev) >= opts.simThreshold) {
-            near = true;
-            break;
-          }
-        }
-        if (near) continue;
-      }
+    if (pid) seenIds.add(pid);
+    if (imgKey) seenImages.add(imgKey);
+    if (titleKey) seenTitle.add(titleKey);
 
-      if (opts.checkId && pid) seenIds.add(pid);
-      if (opts.checkImage && imgKey) seenImages.add(imgKey);
-      if (opts.checkNearTitle) chosenTitleTokens.push(p._titleTokens);
+    chosen.push(p);
+  }
 
-      chosen.push(p);
-    }
-    return chosen;
-  };
-
-  let out = pass({ checkId: true, checkImage: true, checkNearTitle: true, simThreshold: 0.82 });
-  if (out.length < 4) out = pass({ checkId: true, checkImage: true, checkNearTitle: true, simThreshold: 0.72 });
-  if (out.length < 4) out = pass({ checkId: true, checkImage: true, checkNearTitle: false, simThreshold: 0 });
-  if (out.length < 4) out = sortedCandidates.slice(0, 4);
-  return out;
+  return chosen;
 }
 
 /* =========================
    Normalize products
+   ✅ IMPORTANT: target_* FIRST (avoid CNY)
 ========================= */
-function normalizeProducts(rawProducts, query) {
+function normalizeProducts(rawProducts) {
   return rawProducts
     .map((p) => {
       const title = p?.product_title || p?.title || "منتج";
@@ -585,22 +600,24 @@ function normalizeProducts(rawProducts, query) {
 
       const detailUrl = p?.product_detail_url || p?.product_url || p?.url || "";
 
+      // ✅ target_* FIRST
       const priceRaw =
+        p?.target_app_sale_price ||
+        p?.target_sale_price ||
         p?.app_sale_price ||
         p?.sale_price ||
         p?.original_price ||
-        p?.target_app_sale_price ||
-        p?.target_sale_price ||
         "";
 
       const priceNum = numFromAny(priceRaw);
 
+      // ✅ target currency FIRST
       const currency =
+        p?.target_app_sale_price_currency ||
+        p?.target_sale_price_currency ||
         p?.app_sale_price_currency ||
         p?.sale_price_currency ||
         p?.original_price_currency ||
-        p?.target_app_sale_price_currency ||
-        p?.target_sale_price_currency ||
         "USD";
 
       const orders = Number(p?.lastest_volume ?? p?.last_volume ?? p?.volume ?? p?.sales_count ?? 0) || 0;
@@ -615,8 +632,6 @@ function normalizeProducts(rawProducts, query) {
 
       const imageKey = image ? normalizeImageKey(image) : "";
       const priceILS = priceToILS(priceNum, currency);
-
-      // boost score (helps selection stage when many candidates)
       const boost = chargerBoostScore(title);
 
       return {
@@ -632,7 +647,6 @@ function normalizeProducts(rawProducts, query) {
         rating5,
         productId,
         affiliateLink: "",
-        _titleTokens: tokenizeTitleForSimilarity(shortTitle),
         boost,
       };
     })
@@ -678,10 +692,11 @@ function extractPromotionLinks(apiData) {
    Collage 2x2 (NO TEXT) + smaller numbers
 ========================= */
 function numberBadgeSVG(num) {
+  // أصغر من قبل
   return `
-  <svg width="78" height="78">
-    <circle cx="39" cy="39" r="33" fill="#ff5a2a"/>
-    <text x="39" y="52" font-size="40" text-anchor="middle"
+  <svg width="70" height="70">
+    <circle cx="35" cy="35" r="30" fill="#ff5a2a"/>
+    <text x="35" y="48" font-size="36" text-anchor="middle"
           fill="#ffffff" font-family="Arial" font-weight="800">${num}</text>
   </svg>`;
 }
@@ -718,6 +733,7 @@ async function buildCollage(items) {
 
     layers.push({ input: img, left, top });
 
+    // رقم فقط
     layers.push({
       input: Buffer.from(numberBadgeSVG(i + 1)),
       left: left + 14,
@@ -740,7 +756,7 @@ async function buildCollage(items) {
 }
 
 /* =========================
-   Caption (NO "أفضل 4..." / NO "الرابط:")
+   Caption (order: Sales -> Rating -> Price)
 ========================= */
 function buildCaption(query, items) {
   let msg = `🔎 البحث: ${query}\n\n`;
@@ -751,9 +767,9 @@ function buildCaption(query, items) {
     const ratingText = p.rating5 ? `${p.rating5}/5` : "—";
 
     msg += `${i + 1}️⃣ ${p.shortTitle}\n`;
-    msg += `💰 السعر: ${priceText}\n`;
     msg += `🛒 المبيعات: ${p.orders}\n`;
     msg += `⭐ التقييم: ${ratingText}\n`;
+    msg += `💰 السعر: ${priceText}\n`;
     msg += `${link}\n\n`;
   });
 
@@ -766,7 +782,16 @@ function buildCaption(query, items) {
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "أهلًا 👋\nاكتب مثلًا:\nابحث عن ساعة ذكية\nابحث لي عن شاحن 65W"
+`🤖 مرحبًا بكم في علي بوت AI"! 🎉
+
+بوتنا الذكي يعرف كيف يعثر لكم على أفضل المنتجات على علي إكسبريس — اعتمادًا على التقييمات، المراجعات، وعمليات الشراء الحقيقية 🔍
+
+فقط اكتبوا:
+💬 ابحث عن... ثم اسم المنتج الذي تريدونه
+
+وخلال ثوانٍ ستحصلون على أفضل 4 صفقات وأكثرها توفيرًا على الإنترنت 💥
+
+⚡️ نصيحة صغيرة: كلما كانت كتابتكم أدق — كانت النتائج أقرب لما تريدون 🎯`
   );
 });
 
@@ -789,27 +814,42 @@ bot.on("message", async (msg) => {
   try {
     bot.sendChatAction(chatId, "upload_photo");
 
-    const { products: rawProducts, gateway } = await affiliateProductQueryWithFallback(query);
-    const normAll = normalizeProducts(rawProducts, query);
+    const { products: rawProducts, gateway, targetCurrency } =
+      await affiliateProductQueryWithFallback(query);
 
-    // ========= 1) STRONG INTENT FILTER =========
+    const normAll = normalizeProducts(rawProducts);
+
+    // فلترة على مراحل (أقوى نتائج)
     let candidates = normAll.filter((p) => passesStrongIntent(p.title, query));
 
-    // إذا ما كفت: نخفف شوي (نبقي المواصفات الرقمية + منع الاكسسوارات)
     if (candidates.length < 4) {
-      const { watt, mah } = extractNumberUnit(query);
-      candidates = normAll.filter((p) => titleHasWatt(p.title, watt) && titleHasMah(p.title, mah));
+      candidates = normAll.filter((p) => passesRelaxedButSmart(p.title, query));
     }
 
-    // إذا ما كفت: fallback (بدون فلترة قوية)
+    if (candidates.length < 4) {
+      // آخر محاولة: وات/mah فقط + منع الاكسسوارات والكابلات إذا المستخدم يريد شاحن
+      const { watt, mah } = extractNumberUnit(query);
+      const intent = extractIntent(query);
+
+      candidates = normAll.filter((p) => {
+        if (!titleHasWatt(p.title, watt)) return false;
+        if (!titleHasMah(p.title, mah)) return false;
+        if (isObviouslyAccessory(p.title)) return false;
+
+        if (intent.wantsCharger) {
+          const ban = ["cable", "كابل", "wire", "سلك"];
+          if (containsAny(p.title, ban)) return false;
+        }
+        return true;
+      });
+    }
+
     if (candidates.length < 4) candidates = normAll;
 
-    // ========= 2) اختيار أفضل المرشحين قبل الترتيب النهائي =========
-    // نعطي أفضلية داخل الترشيح للشواحن: PD/GaN/USB-C (بدون تغيير ترتيبك النهائي لاحقًا)
-    // نعمل pre-sort صغير فقط لرفع “الجودة” ثم نطبق ترتيبك النهائي
+    // تحسينات ترتيب داخلية (تعزيز GaN/PD للشواحن)
     candidates.sort((a, b) => (b.boost || 0) - (a.boost || 0));
 
-    // ========= 3) ترتيبك النهائي المطلوب: المبيعات ثم التقييم ثم السعر =========
+    // ✅ ترتيبك النهائي: المبيعات ثم التقييم ثم السعر
     candidates.sort((a, b) => {
       const oa = Number(a.orders || 0);
       const ob = Number(b.orders || 0);
@@ -824,10 +864,13 @@ bot.on("message", async (msg) => {
       return pa - pb;
     });
 
+    // ✅ منع التكرار (ID + صورة + عنوان)
     const top4 = pickTop4Unique(candidates);
 
     console.log(
-      `rawProducts:${rawProducts.length} normalized:${normAll.length} picked:${top4.length} (gw=${gwLabel(gateway)})`
+      `raw:${rawProducts.length} normalized:${normAll.length} candidates:${candidates.length} picked:${top4.length} (gw=${gwLabel(
+        gateway
+      )} cur=${targetCurrency || "?"})`
     );
 
     if (top4.length < 4) {
