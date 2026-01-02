@@ -24,9 +24,8 @@ if (!TRACKING_ID) throw new Error("Missing TRACKING_ID");
 
 const DEBUG = String(process.env.DEBUG || "").trim() === "1";
 
-// Optional currency rates (Render Env)
-const CNY_TO_ILS_RATE = Number(process.env.CNY_TO_ILS_RATE || "0"); // ex 0.52
-const USD_TO_ILS_RATE = Number(process.env.USD_TO_ILS_RATE || "0"); // ex 3.7
+// ضع قيمة الدولار للشيكل في Render
+const USD_TO_ILS_RATE = Number(process.env.USD_TO_ILS_RATE || "0");
 
 /* =========================
    Telegram webhook server
@@ -128,6 +127,7 @@ function buildGatewayList() {
     "https://eco.taobao.com/router/rest",
     "https://api.taobao.com/router/rest",
   ].filter(Boolean);
+
   return [...new Set(list)];
 }
 
@@ -180,24 +180,21 @@ function getApiErrorSummary(apiData) {
 }
 
 /* =========================
-   Arabic -> English hint
+   Arabic -> English hint (to improve search)
 ========================= */
 function arabicToEnglishHint(q) {
-  const s = q.trim().toLowerCase();
+  const s = (q || "").trim().toLowerCase();
   const map = [
-    [/شاحن\s*65w/g, "65w charger"],
+    [/شاحن\s*65w/g, "65w gan charger pd"],
     [/65\s*واط/g, "65w"],
     [/100\s*واط/g, "100w"],
-    [/شاحن/g, "charger adapter pd"],
+    [/شاحن/g, "charger pd"],
     [/محول/g, "adapter"],
-    [/كابل/g, "cable"],
+    [/كابل/g, "usb c cable"],
     [/باور\s*بانك/g, "power bank"],
     [/بنك\s*طاقة/g, "power bank"],
     [/ساعة\s*ذكية/g, "smartwatch"],
-    [/ساعة/g, "watch"],
     [/سماعات/g, "earbuds"],
-    [/بلوتوث/g, "bluetooth"],
-    [/لاسلكي/g, "wireless"],
   ];
   let out = s;
   for (const [re, rep] of map) out = out.replace(re, rep);
@@ -287,7 +284,7 @@ async function affiliateProductQueryWithFallback(keyword) {
 /* =========================
    Title short (NO ... / NO cut word)
 ========================= */
-function cleanTitle(title, maxLen = 55, maxWords = 9) {
+function cleanTitle(title, maxWords = 9) {
   if (!title) return "منتج";
 
   let t = String(title);
@@ -295,9 +292,9 @@ function cleanTitle(title, maxLen = 55, maxWords = 9) {
   t = t
     .replace(/[™®©]/g, "")
     .replace(/\s+/g, " ")
-    .replace(/\b(Hot|New|Best|Sale|Original|202\d|Free\s*Shipping|Shipping|Discount|Top)\b/gi, "")
+    .replace(/\b(Hot|New|Best|Sale|Original|202\d|Free\s*Shipping|Shipping|Discount|Top|Choice)\b/gi, "")
     .replace(/\b(For|With|And|Or|The|A|An)\b/gi, "")
-    .replace(/\b(حار|جديد|الأفضل|تخفيض|عرض|أصلي|شحن\s*مجاني|توصيل|خصم)\b/gi, "")
+    .replace(/\b(حار|جديد|الأفضل|تخفيض|خصم|عرض|أصلي|شحن\s*مجاني|توصيل)\b/gi, "")
     .replace(/[.،,:;|/\\()[\]{}"“”'’…]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -305,14 +302,7 @@ function cleanTitle(title, maxLen = 55, maxWords = 9) {
   if (!t) return "منتج";
 
   const words = t.split(" ").filter(Boolean);
-  const shortened = words.slice(0, maxWords).join(" ");
-
-  if (shortened.length <= maxLen) return shortened;
-
-  const cut = shortened.slice(0, maxLen).trim();
-  const lastSpace = cut.lastIndexOf(" ");
-  if (lastSpace > 15) return cut.slice(0, lastSpace).trim();
-  return cut;
+  return words.slice(0, maxWords).join(" ").trim() || "منتج";
 }
 
 /* =========================
@@ -327,52 +317,168 @@ function numFromAny(x) {
 function priceToILS(priceNum, currency) {
   if (!Number.isFinite(priceNum)) return null;
   const cur = String(currency || "").toUpperCase();
-
   if (cur === "ILS") return priceNum;
-  if (cur === "CNY" && CNY_TO_ILS_RATE > 0) return priceNum * CNY_TO_ILS_RATE;
   if (cur === "USD" && USD_TO_ILS_RATE > 0) return priceNum * USD_TO_ILS_RATE;
-
   return null;
 }
 
-function formatPriceILS(priceNum, currency) {
+function formatPrice(priceNum, currency) {
   const ils = priceToILS(priceNum, currency);
   if (ils !== null) return `₪${ils.toFixed(2)}`;
   if (priceNum === null || priceNum === undefined) return "—";
-  return `${currency || ""} ${priceNum}`;
+  const cur = String(currency || "").toUpperCase() || "USD";
+  return `${cur} ${Number(priceNum).toFixed(2)}`;
 }
 
 function ratingTo5(raw) {
   const n = numFromAny(raw);
   if (!Number.isFinite(n)) return null;
-
   if (n > 5 && n <= 100) return Math.round((n / 20) * 10) / 10; // 98 => 4.9
   if (n >= 0 && n <= 5) return Math.round(n * 10) / 10;
-
   return null;
 }
 
 /* =========================
-   Relevance score (Arabic + English hint)
+   STRONG INTENT FILTER (this makes results like competitor)
 ========================= */
-function relevanceScore(query, title) {
-  const hint = arabicToEnglishHint(query) || "";
-  const combined = `${query} ${hint}`;
-
-  const q = String(combined)
+function normText(s) {
+  return String(s || "")
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .split(/\s+/)
-    .filter((w) => w.length >= 2);
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
-  const t = String(title || "").toLowerCase();
+function extractNumberUnit(query) {
+  const q = normText(query);
+  const watt = q.match(/(\d{2,4})\s*(w|واط)\b/);
+  const mah = q.match(/(\d{4,6})\s*(mah)\b/);
+  return {
+    watt: watt ? Number(watt[1]) : null,
+    mah: mah ? Number(mah[1]) : null,
+  };
+}
 
-  let score = 0;
-  for (const w of new Set(q)) {
-    if (t.includes(w)) score += 2;
+function extractIntent(query) {
+  const q = normText(query);
+  const wantsCharger = /\b(شاحن|charger|adapter|محول)\b/.test(q) && !/\b(كابل|cable)\b/.test(q);
+  const wantsCable = /\b(كابل|cable)\b/.test(q);
+  const wantsPowerBank = /\b(باور|power)\b/.test(q) && /\b(بانك|bank)\b/.test(q);
+  const wantsWatch = /\b(ساعة)\b/.test(q) && /\b(ذكية|smart)\b/.test(q);
+  return { wantsCharger, wantsCable, wantsPowerBank, wantsWatch };
+}
+
+function titleHasWatt(title, watt) {
+  if (!watt) return true;
+  const t = normText(title);
+  const re = new RegExp(`\\b${watt}\\s*(w|واط)\\b`, "i");
+  if (!re.test(t)) return false;
+
+  // ممنوع watt مختلفة إذا المستخدم طلب رقم محدد
+  const all = [...t.matchAll(/(\d{2,4})\s*(w|واط)\b/g)].map((m) => Number(m[1]));
+  if (all.length && !all.includes(watt)) return false;
+
+  return true;
+}
+
+function titleHasMah(title, mah) {
+  if (!mah) return true;
+  const t = normText(title);
+  const re = new RegExp(`\\b${mah}\\s*(mah)\\b`, "i");
+  return re.test(t);
+}
+
+function containsAny(text, list) {
+  const t = normText(text);
+  return list.some((x) => t.includes(x));
+}
+
+function queryTokens(query) {
+  const q = normText(query)
+    .split(" ")
+    .filter((w) => w.length >= 2)
+    .filter((w) => !["ابحث", "عن", "لي"].includes(w));
+  return [...new Set(q)];
+}
+
+function minTokenMatch(title, query, minHits = 1) {
+  const t = normText(title);
+  const toks = queryTokens(query);
+  if (!toks.length) return true;
+
+  // لا نحسب الأرقام كوحدة هنا لأنها تُفحص منفصلة
+  const filtered = toks.filter((w) => !/^\d+$/.test(w));
+  if (!filtered.length) return true;
+
+  let hits = 0;
+  for (const w of filtered) {
+    if (t.includes(w)) hits++;
+    if (hits >= minHits) return true;
   }
-  if (q.length && t.includes(q[0])) score += 3;
-  return score;
+  return false;
+}
+
+// Boost keywords (not sorting, but used to choose better candidates when results كثيرة)
+function chargerBoostScore(title) {
+  const t = normText(title);
+  let s = 0;
+  if (/\bgan\b/.test(t)) s += 3;
+  if (/\bpd\b/.test(t) || t.includes("power delivery")) s += 2;
+  if (t.includes("usb c") || t.includes("usb-c") || t.includes("type c")) s += 2;
+  if (/\bqc\b/.test(t)) s += 1;
+  // يقلل فرص “kit/cover/case”
+  if (t.includes("case") || t.includes("cover") || t.includes("holder") || t.includes("stand")) s -= 3;
+  return s;
+}
+
+function passesStrongIntent(productTitle, query) {
+  const { watt, mah } = extractNumberUnit(query);
+  const intent = extractIntent(query);
+  const title = productTitle || "";
+
+  // 1) مواصفات رقمية صارمة
+  if (!titleHasWatt(title, watt)) return false;
+  if (!titleHasMah(title, mah)) return false;
+
+  // 2) على الأقل تطابق كلمة من البحث (يحسن الدقة جدًا)
+  // للشواحن نطلب تطابق أقوى (minHits=2) غالباً
+  const minHits = intent.wantsCharger ? 2 : 1;
+  if (!minTokenMatch(title, query, minHits)) return false;
+
+  // 3) فلترة حسب النية + منع الاكسسوارات
+  const banCommon = [
+    "holder","stand","dock","hub","mount","bracket","case","cover","skin","sticker",
+    "حامل","ستاند","قاعدة","كفر","جراب","غطاء","ملصق","موزع","هاب"
+  ];
+
+  if (containsAny(title, banCommon)) return false;
+
+  if (intent.wantsCharger) {
+    const must = ["charger", "adapter", "شاحن", "محول", "gan", "pd"];
+    const ban = ["cable", "كابل", "wire", "سلك"];
+    if (!containsAny(title, must)) return false;
+    if (containsAny(title, ban)) return false;
+  }
+
+  if (intent.wantsCable) {
+    const must = ["cable", "كابل", "wire", "سلك", "usb c", "usb-c", "type c"];
+    const ban = ["charger", "شاحن", "adapter", "محول"];
+    if (!containsAny(title, must)) return false;
+    // أحيانًا يكون “cable for charger” فلا نمنع بشدة هنا
+    if (containsAny(title, ban) && !containsAny(title, ["cable","كابل"])) return false;
+  }
+
+  if (intent.wantsPowerBank) {
+    const must = ["power bank", "battery bank", "باور", "بانك"];
+    if (!containsAny(title, must)) return false;
+  }
+
+  if (intent.wantsWatch) {
+    const must = ["smartwatch", "watch", "ساعة", "ذكية"];
+    if (!containsAny(title, must)) return false;
+  }
+
+  return true;
 }
 
 /* =========================
@@ -457,7 +563,6 @@ function pickTop4Unique(sortedCandidates) {
   if (out.length < 4) out = pass({ checkId: true, checkImage: true, checkNearTitle: true, simThreshold: 0.72 });
   if (out.length < 4) out = pass({ checkId: true, checkImage: true, checkNearTitle: false, simThreshold: 0 });
   if (out.length < 4) out = sortedCandidates.slice(0, 4);
-
   return out;
 }
 
@@ -468,7 +573,7 @@ function normalizeProducts(rawProducts, query) {
   return rawProducts
     .map((p) => {
       const title = p?.product_title || p?.title || "منتج";
-      const shortTitle = cleanTitle(title, 55, 9);
+      const shortTitle = cleanTitle(title, 9);
 
       const image =
         p?.product_main_image_url ||
@@ -496,14 +601,12 @@ function normalizeProducts(rawProducts, query) {
         p?.original_price_currency ||
         p?.target_app_sale_price_currency ||
         p?.target_sale_price_currency ||
-        (String(priceRaw).includes("US") ? "USD" : "CNY");
+        "USD";
 
       const orders = Number(p?.lastest_volume ?? p?.last_volume ?? p?.volume ?? p?.sales_count ?? 0) || 0;
 
       const ratingRaw = p?.evaluate_rate || p?.avg_evaluate_rate || p?.rating || null;
       const rating5 = ratingTo5(ratingRaw);
-
-      const rel = relevanceScore(query, title);
 
       const productId =
         String(p?.product_id || p?.item_id || p?.productId || "").trim() ||
@@ -511,6 +614,10 @@ function normalizeProducts(rawProducts, query) {
         null;
 
       const imageKey = image ? normalizeImageKey(image) : "";
+      const priceILS = priceToILS(priceNum, currency);
+
+      // boost score (helps selection stage when many candidates)
+      const boost = chargerBoostScore(title);
 
       return {
         title,
@@ -520,24 +627,36 @@ function normalizeProducts(rawProducts, query) {
         detailUrl,
         priceNum,
         currency,
+        priceILS,
         orders,
         rating5,
-        rel,
         productId,
         affiliateLink: "",
         _titleTokens: tokenizeTitleForSimilarity(shortTitle),
+        boost,
       };
     })
     .filter((x) => x.image && x.detailUrl);
 }
 
 /* =========================
-   Affiliate link generate (chunked) + FILTER affiliate only
+   Affiliate link generate
 ========================= */
-function chunkArray(arr, size) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
+async function affiliateLinkGenerate(sourceUrls) {
+  const gateways = buildGatewayList();
+  for (const gateway of gateways) {
+    try {
+      const data = await topPost(gateway, "aliexpress.affiliate.link.generate", {
+        promotion_link_type: 0,
+        source_values: sourceUrls.join(","),
+        tracking_id: TRACKING_ID,
+      });
+      return data;
+    } catch (e) {
+      console.error("link.generate failed:", gwLabel(gateway), e?.message);
+    }
+  }
+  return null;
 }
 
 function extractPromotionLinks(apiData) {
@@ -553,51 +672,6 @@ function extractPromotionLinks(apiData) {
     [];
 
   return Array.isArray(arr) ? arr : [];
-}
-
-async function generateAffiliateLinkMap(urls) {
-  const gateways = buildGatewayList();
-  const map = new Map();
-
-  // AliExpress sometimes fails if we send too many urls at once
-  const chunks = chunkArray(urls, 20);
-
-  for (const chunk of chunks) {
-    let data = null;
-
-    for (const gw of gateways) {
-      try {
-        data = await topPost(gw, "aliexpress.affiliate.link.generate", {
-          promotion_link_type: 0,
-          source_values: chunk.join(","),
-          tracking_id: TRACKING_ID,
-        });
-        break;
-      } catch (e) {
-        console.error("link.generate failed:", gwLabel(gw), e?.message);
-      }
-    }
-
-    if (!data) continue;
-
-    const linksArr = extractPromotionLinks(data);
-    for (const row of linksArr) {
-      const src = row?.source_value;
-      const promo = row?.promotion_link;
-      if (src && promo) map.set(src, promo);
-    }
-  }
-
-  return map;
-}
-
-async function attachAffiliateLinks(products) {
-  const urls = products.map((p) => p.detailUrl).filter(Boolean);
-  const linkMap = await generateAffiliateLinkMap(urls);
-  for (const p of products) {
-    p.affiliateLink = p.detailUrl ? (linkMap.get(p.detailUrl) || "") : "";
-  }
-  return products;
 }
 
 /* =========================
@@ -666,20 +740,21 @@ async function buildCollage(items) {
 }
 
 /* =========================
-   Caption (affiliate link only)
+   Caption (NO "أفضل 4..." / NO "الرابط:")
 ========================= */
 function buildCaption(query, items) {
   let msg = `🔎 البحث: ${query}\n\n`;
 
   items.forEach((p, i) => {
-    const priceText = formatPriceILS(p.priceNum, p.currency);
+    const link = p.affiliateLink || p.detailUrl || "—";
+    const priceText = formatPrice(p.priceNum, p.currency);
     const ratingText = p.rating5 ? `${p.rating5}/5` : "—";
 
     msg += `${i + 1}️⃣ ${p.shortTitle}\n`;
     msg += `💰 السعر: ${priceText}\n`;
     msg += `🛒 المبيعات: ${p.orders}\n`;
     msg += `⭐ التقييم: ${ratingText}\n`;
-    msg += `${p.affiliateLink}\n\n`; // فقط رابط الأفلييت
+    msg += `${link}\n\n`;
   });
 
   return msg.trim();
@@ -697,11 +772,10 @@ bot.onText(/\/start/, (msg) => {
 
 function parseQuery(text) {
   const t = (text || "").trim();
-  const cleaned = t
+  return t
     .replace(/^\s*ابحث(\s+لي)?\s+عن\s+/i, "")
     .replace(/^\s*ابحث\s+/i, "")
     .trim();
-  return cleaned || t;
 }
 
 bot.on("message", async (msg) => {
@@ -716,40 +790,64 @@ bot.on("message", async (msg) => {
     bot.sendChatAction(chatId, "upload_photo");
 
     const { products: rawProducts, gateway } = await affiliateProductQueryWithFallback(query);
-
     const normAll = normalizeProducts(rawProducts, query);
 
-    // 1) candidates by relevance if possible
-    let candidates = normAll.filter((p) => p.rel >= 2);
-    if (candidates.length < 10) candidates = normAll;
+    // ========= 1) STRONG INTENT FILTER =========
+    let candidates = normAll.filter((p) => passesStrongIntent(p.title, query));
 
-    // 2) sort
-    candidates.sort((a, b) => (b.rel - a.rel) || (b.orders - a.orders));
-
-    // 3) Take a pool, generate affiliate links, keep ONLY commissionable
-    //    (اول 40 ثم توسعة 80 لو ما كفت)
-    const pool1 = candidates.slice(0, 40);
-    await attachAffiliateLinks(pool1);
-    let affiliateOnly = pool1.filter((p) => p.affiliateLink);
-
-    if (affiliateOnly.length < 4) {
-      const pool2 = candidates.slice(0, 80);
-      await attachAffiliateLinks(pool2);
-      affiliateOnly = pool2.filter((p) => p.affiliateLink);
+    // إذا ما كفت: نخفف شوي (نبقي المواصفات الرقمية + منع الاكسسوارات)
+    if (candidates.length < 4) {
+      const { watt, mah } = extractNumberUnit(query);
+      candidates = normAll.filter((p) => titleHasWatt(p.title, watt) && titleHasMah(p.title, mah));
     }
 
-    // 4) final sort + dedupe + pick 4
-    affiliateOnly.sort((a, b) => (b.rel - a.rel) || (b.orders - a.orders));
-    const top4 = pickTop4Unique(affiliateOnly);
+    // إذا ما كفت: fallback (بدون فلترة قوية)
+    if (candidates.length < 4) candidates = normAll;
+
+    // ========= 2) اختيار أفضل المرشحين قبل الترتيب النهائي =========
+    // نعطي أفضلية داخل الترشيح للشواحن: PD/GaN/USB-C (بدون تغيير ترتيبك النهائي لاحقًا)
+    // نعمل pre-sort صغير فقط لرفع “الجودة” ثم نطبق ترتيبك النهائي
+    candidates.sort((a, b) => (b.boost || 0) - (a.boost || 0));
+
+    // ========= 3) ترتيبك النهائي المطلوب: المبيعات ثم التقييم ثم السعر =========
+    candidates.sort((a, b) => {
+      const oa = Number(a.orders || 0);
+      const ob = Number(b.orders || 0);
+      if (ob !== oa) return ob - oa;
+
+      const ra = Number(a.rating5 || 0);
+      const rb = Number(b.rating5 || 0);
+      if (rb !== ra) return rb - ra;
+
+      const pa = Number.isFinite(a.priceILS) ? a.priceILS : (Number(a.priceNum) || 999999);
+      const pb = Number.isFinite(b.priceILS) ? b.priceILS : (Number(b.priceNum) || 999999);
+      return pa - pb;
+    });
+
+    const top4 = pickTop4Unique(candidates);
 
     console.log(
-      `rawProducts:${rawProducts.length} normalized:${normAll.length} affiliateOnly:${affiliateOnly.length} picked:${top4.length} (gw=${gwLabel(
-        gateway
-      )})`
+      `rawProducts:${rawProducts.length} normalized:${normAll.length} picked:${top4.length} (gw=${gwLabel(gateway)})`
     );
 
     if (top4.length < 4) {
-      return bot.sendMessage(chatId, "ما لقيت 4 منتجات عليها تسويق بالعمولة. جرّب كلمة ثانية 🙂");
+      return bot.sendMessage(chatId, "ما لقيت 4 نتائج مناسبة. جرّب كلمة ثانية 🙂");
+    }
+
+    // affiliate links
+    const urls = top4.map((p) => p.detailUrl).filter(Boolean);
+    if (urls.length) {
+      const linkData = await affiliateLinkGenerate(urls);
+      if (linkData) {
+        const linksArr = extractPromotionLinks(linkData);
+        const linkMap = new Map();
+        for (const row of linksArr) {
+          if (row?.source_value && row?.promotion_link) linkMap.set(row.source_value, row.promotion_link);
+        }
+        top4.forEach((p) => {
+          p.affiliateLink = p.detailUrl ? (linkMap.get(p.detailUrl) || "") : "";
+        });
+      }
     }
 
     const collage = await buildCollage(top4);
