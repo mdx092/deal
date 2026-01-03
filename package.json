@@ -1,11 +1,10 @@
 {
   "name": "deals48-telegram-bot",
   "version": "1.0.0",
-  "description": "Deals48 Telegram bot (AliExpress Affiliate + GPT rerank + collage)",
+  "private": true,
   "type": "module",
-  "main": "index.js",
   "engines": {
-    "node": ">=18"
+    "node": "18.x"
   },
   "scripts": {
     "start": "node index.js"
