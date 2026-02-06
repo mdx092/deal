@@ -1,12 +1,12 @@
 import TelegramBot from "node-telegram-bot-api";
 
 // ================== ENV ==================
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const RAPID_API_KEY = process.env.RAPID_API_KEY;
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const RAPID_API_KEY = process.env.ALI_APP_SECRET; // لو كنت تستخدم RapidAPI غيّر هذا لاحقًا
 const RAPID_API_HOST = "aliexpress-datahub.p.rapidapi.com";
 
-if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN");
-if (!RAPID_API_KEY) throw new Error("Missing RAPID_API_KEY");
+if (!BOT_TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN");
+if (!RAPID_API_KEY) throw new Error("Missing ALI_APP_SECRET");
 
 // ================== BOT ==================
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
@@ -39,7 +39,7 @@ function relevanceScore(query, title) {
   return qWords.filter(w => t.includes(w)).length;
 }
 
-// ================== ALIEXPRESS ==================
+// ================== ALIEXPRESS SEARCH ==================
 async function searchAliExpress(keyword) {
   const url = `https://${RAPID_API_HOST}/item_search?q=${encodeURIComponent(
     keyword
@@ -65,17 +65,12 @@ async function searchBestProducts(query) {
   const raw = await searchAliExpress(query);
   if (!raw.length) return [];
 
-  const scored = raw
+  return raw
     .map(normalizeProduct)
-    .map(p => ({
-      ...p,
-      score: relevanceScore(query, p.title),
-    }))
+    .map(p => ({ ...p, score: relevanceScore(query, p.title) }))
     .filter(p => p.score >= 1)
     .sort((a, b) => b.score - a.score)
     .slice(0, 5);
-
-  return scored;
 }
 
 // ================== TELEGRAM HANDLER ==================
@@ -88,7 +83,7 @@ bot.on("message", async msg => {
   if (!isMeaningfulQuery(text)) {
     await bot.sendMessage(
       chatId,
-      "❌ الطلب غير واضح\n\n✍️ اكتب اسم منتج حقيقي مثل:\n• سماعة بلوتوث\n• شاحن USB-C\n• ساعة ذكية"
+      "❌ الطلب غير واضح\n\n✍️ مثال:\n• سماعة بلوتوث\n• شاحن USB-C\n• ساعة ذكية"
     );
     return;
   }
@@ -101,7 +96,7 @@ bot.on("message", async msg => {
     if (!products.length) {
       await bot.sendMessage(
         chatId,
-        "😕 لم أجد منتجات مطابقة تمامًا لطلبك.\nجرّب كتابة اسم أوضح."
+        "😕 لم أجد منتجات مطابقة تمامًا.\nجرّب اسمًا أوضح."
       );
       return;
     }
