@@ -1,10 +1,6 @@
 import TelegramBot from "node-telegram-bot-api";
-import fetch from "node-fetch";
-import dotenv from "dotenv";
 
-dotenv.config();
-
-// ================= CONFIG =================
+// ================== ENV ==================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const RAPID_API_KEY = process.env.RAPID_API_KEY;
 const RAPID_API_HOST = "aliexpress-datahub.p.rapidapi.com";
@@ -12,12 +8,11 @@ const RAPID_API_HOST = "aliexpress-datahub.p.rapidapi.com";
 if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN");
 if (!RAPID_API_KEY) throw new Error("Missing RAPID_API_KEY");
 
-// ================= BOT =================
+// ================== BOT ==================
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+console.log("🤖 Telegram bot started");
 
-console.log("🤖 Bot started");
-
-// ================= UTILS =================
+// ================== HELPERS ==================
 function isMeaningfulQuery(q) {
   if (!q) return false;
   if (q.length < 3) return false;
@@ -36,16 +31,19 @@ function normalizeProduct(p) {
 }
 
 function relevanceScore(query, title) {
-  const qWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+  const qWords = query
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(w => w.length > 2);
   const t = title.toLowerCase();
   return qWords.filter(w => t.includes(w)).length;
 }
 
-// ================= ALIEXPRESS SEARCH =================
+// ================== ALIEXPRESS ==================
 async function searchAliExpress(keyword) {
   const url = `https://${RAPID_API_HOST}/item_search?q=${encodeURIComponent(
     keyword
-  )}&page=1&pageSize=20&sort=SALE_PRICE_ASC`;
+  )}&page=1&pageSize=25&sort=SALE_PRICE_ASC`;
 
   const res = await fetch(url, {
     headers: {
@@ -60,16 +58,15 @@ async function searchAliExpress(keyword) {
   return json?.data?.products || [];
 }
 
-// ================= MAIN SEARCH =================
+// ================== MAIN SEARCH ==================
 async function searchBestProducts(query) {
   if (!isMeaningfulQuery(query)) return [];
 
   const raw = await searchAliExpress(query);
   if (!raw.length) return [];
 
-  const normalized = raw.map(normalizeProduct);
-
-  const filtered = normalized
+  const scored = raw
+    .map(normalizeProduct)
     .map(p => ({
       ...p,
       score: relevanceScore(query, p.title),
@@ -78,10 +75,10 @@ async function searchBestProducts(query) {
     .sort((a, b) => b.score - a.score)
     .slice(0, 5);
 
-  return filtered;
+  return scored;
 }
 
-// ================= TELEGRAM HANDLER =================
+// ================== TELEGRAM HANDLER ==================
 bot.on("message", async msg => {
   const chatId = msg.chat.id;
   const text = msg.text?.trim();
@@ -89,20 +86,20 @@ bot.on("message", async msg => {
   if (!text) return;
 
   if (!isMeaningfulQuery(text)) {
-    bot.sendMessage(
+    await bot.sendMessage(
       chatId,
-      "❌ الطلب غير واضح\n\n✍️ اكتب اسم منتج حقيقي مثل:\n• سماعة بلوتوث\n• شاحن 65W\n• ساعة ذكية"
+      "❌ الطلب غير واضح\n\n✍️ اكتب اسم منتج حقيقي مثل:\n• سماعة بلوتوث\n• شاحن USB-C\n• ساعة ذكية"
     );
     return;
   }
 
-  bot.sendMessage(chatId, "🔍 أبحث عن أفضل العروض…");
+  await bot.sendMessage(chatId, "🔍 أبحث عن أفضل العروض…");
 
   try {
     const products = await searchBestProducts(text);
 
     if (!products.length) {
-      bot.sendMessage(
+      await bot.sendMessage(
         chatId,
         "😕 لم أجد منتجات مطابقة تمامًا لطلبك.\nجرّب كتابة اسم أوضح."
       );
@@ -110,12 +107,15 @@ bot.on("message", async msg => {
     }
 
     for (const p of products) {
-      bot.sendPhoto(chatId, p.image, {
-        caption: `🛒 ${p.title}\n💰 السعر: ${p.price}\n🔗 ${p.link}`,
+      await bot.sendPhoto(chatId, p.image, {
+        caption:
+          `🛒 ${p.title}\n` +
+          `💰 السعر: ${p.price}\n` +
+          `🔗 ${p.link}`,
       });
     }
-  } catch (e) {
-    console.error(e);
-    bot.sendMessage(chatId, "❌ حدث خطأ أثناء البحث.");
+  } catch (err) {
+    console.error(err);
+    await bot.sendMessage(chatId, "❌ حدث خطأ أثناء البحث.");
   }
 });
