@@ -214,6 +214,8 @@ export function parseItem(item) {
 
 export async function queryAliExpress(keyword, cfg, fields = EXTENDED_FIELDS, fetchImpl = fetch) {
   const params = buildRequest(keyword, cfg, fields);
+  // يرجع دائمًا { items, error } حتى نفرّق بين "فشل الاتصال/الصلاحيات" و"لا توجد نتائج"
+  let text = "";
   let data;
   try {
     const res = await fetchImpl(cfg.gateway, {
@@ -222,16 +224,30 @@ export async function queryAliExpress(keyword, cfg, fields = EXTENDED_FIELDS, fe
       body: new URLSearchParams(params).toString(),
       signal: AbortSignal.timeout(15000),
     });
-    data = await res.json();
+    text = await res.text();
+    data = JSON.parse(text);
   } catch (err) {
-    console.error("AliExpress request failed:", err.message);
-    return null;
+    const error = `request failed: ${err.message}${text ? ` | body: ${text.slice(0, 200)}` : ""}`;
+    console.error("AliExpress", error);
+    return { items: [], error };
   }
   if (data?.error_response) {
-    console.error("AliExpress API error:", JSON.stringify(data.error_response));
-    return null;
+    const error = `API error: ${JSON.stringify(data.error_response).slice(0, 300)}`;
+    console.error("AliExpress", error);
+    return { items: [], error };
   }
-  return extractProducts(data);
+  const result = data?.aliexpress_affiliate_product_query_response?.resp_result;
+  if (result && result.resp_code !== undefined && Number(result.resp_code) !== 200) {
+    const error = `resp_code ${result.resp_code}: ${result.resp_msg || "unknown"}`;
+    console.error("AliExpress", error);
+    return { items: [], error };
+  }
+  const items = extractProducts(data);
+  if (!items.length) {
+    // لا أسرار في هذه الاستجابة: نسجّل جزءًا منها لمعرفة السبب الحقيقي من Logs
+    console.warn(`AliExpress returned 0 items for ${JSON.stringify(keyword)}; raw: ${text.slice(0, 400)}`);
+  }
+  return { items, error: null };
 }
 
 export async function searchProducts(userQuery, cfg, deps = {}) {
@@ -241,11 +257,15 @@ export async function searchProducts(userQuery, cfg, deps = {}) {
   const keyword = await translate(cleaned);
   console.log(`search: ${JSON.stringify(userQuery)} -> ${JSON.stringify(keyword)}`);
 
-  let items = await query(keyword, cfg, EXTENDED_FIELDS);
+  if (NON_ASCII.test(keyword)) {
+    console.warn("translation unavailable; searching with the original (non-English) text");
+  }
+
+  let { items, error } = await query(keyword, cfg, EXTENDED_FIELDS);
   // ربما رفضت الواجهة أحد الحقول الموسعة: نجرّب بالحقول الأساسية
-  if (!items || !items.length) items = await query(keyword, cfg, BASE_FIELDS);
-  if (!items || !items.length) return { products: [], keyword };
+  if (!items.length) ({ items, error } = await query(keyword, cfg, BASE_FIELDS));
+  if (!items.length) return { products: [], keyword, error };
 
   const products = items.map(parseItem);
-  return { products: rankProducts(products, keyword, { limit: cfg.limit ?? 4 }), keyword };
+  return { products: rankProducts(products, keyword, { limit: cfg.limit ?? 4 }), keyword, error: null };
 }
