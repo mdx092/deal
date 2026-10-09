@@ -32,6 +32,14 @@ export function normalize(text) {
 }
 
 export function stem(token) {
+  // العربية: حذف "ال" والجمع السالم "ات" وتاء التأنيث (ة صارت ه بعد التطبيع)، فتتطابق سماعة/سماعات
+  if (/^[؀-ۿ]+$/.test(token)) {
+    let t = token;
+    if (t.length > 4 && t.startsWith("ال")) t = t.slice(2);
+    if (t.length > 4 && t.endsWith("ات")) t = t.slice(0, -2);
+    else if (t.length > 3 && t.endsWith("ه")) t = t.slice(0, -1);
+    return t;
+  }
   if (token.length > 4 && token.endsWith("ies")) return token.slice(0, -3) + "y";
   if (token.length > 4 && /(sses|ches|shes|xes)$/.test(token)) return token.slice(0, -2);
   if (token.length > 3 && token.endsWith("s") && !token.endsWith("ss")) return token.slice(0, -1);
@@ -208,7 +216,8 @@ export const BASE_FIELDS =
   "product_id,product_title,product_main_image_url,product_detail_url,sale_price";
 export const EXTENDED_FIELDS =
   BASE_FIELDS +
-  ",promotion_link,original_price,discount,evaluate_rate,lastest_volume,sale_price_currency";
+  ",promotion_link,original_price,discount,evaluate_rate,lastest_volume,sale_price_currency" +
+  ",target_sale_price,target_sale_price_currency";
 
 export function buildRequest(keyword, cfg, fields = EXTENDED_FIELDS, now = Date.now()) {
   const params = {
@@ -244,8 +253,11 @@ export function parseItem(item) {
     id: item.product_id,
     title: item.product_title || "",
     image: item.product_main_image_url,
-    price: item.sale_price,
-    currency: item.sale_price_currency || "",
+    // target_* هي الأسعار بعملة الطلب (target_currency)، ونرجع إلى sale_price إن غابت
+    price: item.target_sale_price ?? item.sale_price,
+    currency:
+      (item.target_sale_price != null ? item.target_sale_price_currency : item.sale_price_currency) || "",
+    detailUrl: item.product_detail_url,
     originalPrice: item.original_price,
     discount: item.discount,
     rating: item.evaluate_rate,
