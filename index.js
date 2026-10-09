@@ -27,6 +27,13 @@ const CFG = {
   fetchSize: 50, // نجلب عددًا أكبر ثم نفلتر ونرتّب محليًا بالصلة
 };
 
+const DEBUG = ["1", "true"].includes(String(env("DEBUG") || "").toLowerCase());
+const whichName = (...names) => names.find(n => process.env[n]) || "-";
+console.log(
+  `config: key=${whichName("AE_APP_KEY", "ALI_APP_KEY")} secret=${whichName("AE_APP_SECRET", "ALI_APP_SECRET")} ` +
+    `gateway=${CFG.gateway} shipTo=${CFG.shipTo || "-"} currency=${CFG.currency || "-"} lang=${CFG.language} debug=${DEBUG}`
+);
+
 // ================== BOT ==================
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 bot.on("polling_error", err => console.error("polling_error:", err.message));
@@ -90,10 +97,19 @@ bot.on("message", async msg => {
   await bot.sendMessage(chatId, "🔍 أبحث عن أفضل العروض…");
 
   try {
-    const { products, keyword } = await searchProducts(query, CFG);
+    const { products, keyword, error } = await searchProducts(query, CFG);
 
     if (!products.length) {
-      await bot.sendMessage(chatId, "😕 لم أجد منتجات مطابقة.\nجرّب اسمًا أوضح.");
+      if (error) {
+        // فشل الاتصال/الصلاحيات ليس "لا توجد نتائج"، ونوضّح الفرق للمستخدم
+        let text = "⚠️ تعذّر الاتصال بخدمة علي إكسبرس حاليًا. حاول لاحقًا.";
+        if (DEBUG) text += `\n\n🛠 ${error}`.slice(0, 600);
+        await bot.sendMessage(chatId, text);
+      } else {
+        let text = "😕 لم أجد منتجات مطابقة.\nجرّب اسمًا أوضح.";
+        if (DEBUG) text += `\n\n🛠 بُحث بـ: ${keyword}`;
+        await bot.sendMessage(chatId, text);
+      }
       return;
     }
 
