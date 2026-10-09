@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  queryAliExpress, cleanQuery, stem, tokens, relevance, rankProducts, toEnglish,
+  queryAliExpress, cleanQuery, _resetTranslationState, stem, tokens, relevance, rankProducts, toEnglish,
   createSign, buildRequest, extractProducts, parseItem, searchProducts,
   BASE_FIELDS, EXTENDED_FIELDS,
 } from "./search.js";
@@ -188,4 +188,63 @@ test("searchProducts surfaces the API error when nothing is found", async () => 
   const r = await quiet(() => searchProducts("headphones", CFG, deps));
   assert.deepEqual(r.products, []);
   assert.equal(r.error, "API error: bad sign");
+});
+
+// ---------- مزوّدو الترجمة ----------
+const jsonRes = (body, ok = true, status = 200) => ({ ok, status, json: async () => body });
+const GOOGLE_OK = jsonRes([[["wireless bluetooth earphones", "x"]], null, "ar"]);
+const MYMEMORY_OK = jsonRes({ responseData: { translatedText: "Bluetooth Headphone" }, responseStatus: 200, quotaFinished: false });
+
+test("translation falls back to MyMemory when Google returns 429", async () => {
+  _resetTranslationState();
+  const urls = [];
+  const f = async url => {
+    urls.push(String(url));
+    return url.includes("googleapis") ? jsonRes(null, false, 429) : MYMEMORY_OK;
+  };
+  const warn = console.warn; console.warn = () => {};
+  try { assert.equal(await toEnglish("سماعة بلوتوث", f), "Bluetooth Headphone"); } finally { console.warn = warn; }
+  assert.ok(urls[1].includes("langpair=ar|en"));
+});
+
+test("a blocked provider is skipped during the cooldown, then retried", async () => {
+  _resetTranslationState();
+  let googleCalls = 0, t = 1000;
+  const f = async url => {
+    if (url.includes("googleapis")) { googleCalls++; return jsonRes(null, false, 429); }
+    return MYMEMORY_OK;
+  };
+  const warn = console.warn; console.warn = () => {};
+  try {
+    await toEnglish("كلمة اولى", f, () => t);
+    await toEnglish("كلمة ثانية", f, () => t + 1000);       // داخل فترة التهدئة
+    assert.equal(googleCalls, 1);
+    await toEnglish("كلمة ثالثة", f, () => t + 6 * 60 * 1000); // بعد 5 دقائق
+    assert.equal(googleCalls, 2);
+  } finally { console.warn = warn; }
+});
+
+test("MyMemory quota warning text is rejected, original query is kept", async () => {
+  _resetTranslationState();
+  const f = async url => url.includes("googleapis")
+    ? jsonRes(null, false, 429)
+    : jsonRes({ responseData: { translatedText: "MYMEMORY WARNING: YOU USED ALL AVAILABLE FREE TRANSLATIONS FOR TODAY" }, responseStatus: 429, quotaFinished: true });
+  const warn = console.warn; console.warn = () => {};
+  try { assert.equal(await toEnglish("سماعة", f), "سماعة"); } finally { console.warn = warn; }
+});
+
+test("untranslated (still Arabic) provider output is not accepted", async () => {
+  _resetTranslationState();
+  const f = async () => jsonRes([[["سماعة", "سماعة"]], null, "ar"]);
+  const warn = console.warn; console.warn = () => {};
+  try { assert.equal(await toEnglish("سماعة", f), "سماعة"); } finally { console.warn = warn; }
+});
+
+test("Google success is cached and MyMemory is never called", async () => {
+  _resetTranslationState();
+  let calls = 0;
+  const f = async url => { calls++; assert.ok(url.includes("googleapis")); return GOOGLE_OK; };
+  assert.equal(await toEnglish("سماعات لاسلكية", f), "wireless bluetooth earphones");
+  assert.equal(await toEnglish("سماعات لاسلكية", f), "wireless bluetooth earphones");
+  assert.equal(calls, 1);
 });
