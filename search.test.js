@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  cleanQuery, stem, tokens, relevance, rankProducts, toEnglish,
+  queryAliExpress, cleanQuery, stem, tokens, relevance, rankProducts, toEnglish,
   createSign, buildRequest, extractProducts, parseItem, searchProducts,
   BASE_FIELDS, EXTENDED_FIELDS,
 } from "./search.js";
@@ -133,7 +133,8 @@ test("searchProducts: cleans, translates, ranks, falls back to base fields", asy
     toEnglish: async q => { seen.push(["translate", q]); return "65W charger"; },
     queryAliExpress: async (kw, _cfg, fields) => {
       seen.push(["query", kw, fields === EXTENDED_FIELDS ? "ext" : "base"]);
-      return fields === EXTENDED_FIELDS ? null : items; // الموسعة تفشل، الأساسية تنجح
+      // الموسعة تفشل، الأساسية تنجح
+      return fields === EXTENDED_FIELDS ? { items: [], error: "bad field" } : { items, error: null };
     },
   };
   const { products, keyword } = await searchProducts("ابحث لي عن شاحن 65W", CFG, deps);
@@ -141,4 +142,50 @@ test("searchProducts: cleans, translates, ranks, falls back to base fields", asy
   assert.deepEqual(seen.slice(1).map(s => s[2]), ["ext", "base"]);
   assert.equal(keyword, "65W charger");
   assert.deepEqual(products.map(p => p.id), [2]);
+});
+
+// ---------- أنماط الفشل الحقيقية: نريد معرفة السبب لا مجرد "لا نتائج" ----------
+const fakeFetch = body => async () => ({ text: async () => (typeof body === "string" ? body : JSON.stringify(body)) });
+const quiet = async fn => {
+  const { error, warn } = console;
+  console.error = console.warn = () => {};
+  try { return await fn(); } finally { console.error = error; console.warn = warn; }
+};
+
+test("queryAliExpress: error_response is reported as an error", async () => {
+  const r = await quiet(() => queryAliExpress("x", CFG, BASE_FIELDS,
+    fakeFetch({ error_response: { code: 29, msg: "Invalid app key" } })));
+  assert.deepEqual(r.items, []);
+  assert.match(r.error, /Invalid app key/);
+});
+
+test("queryAliExpress: non-200 resp_code is reported as an error", async () => {
+  const r = await quiet(() => queryAliExpress("x", CFG, BASE_FIELDS,
+    fakeFetch({ aliexpress_affiliate_product_query_response: { resp_result: { resp_code: 405, resp_msg: "Not authorized" } } })));
+  assert.match(r.error, /405.*Not authorized/);
+});
+
+test("queryAliExpress: non-JSON body (e.g. HTML error page) is an error", async () => {
+  const r = await quiet(() => queryAliExpress("x", CFG, BASE_FIELDS, fakeFetch("<html>Forbidden</html>")));
+  assert.match(r.error, /request failed.*Forbidden/);
+});
+
+test("queryAliExpress: genuinely empty result has no error", async () => {
+  const r = await quiet(() => queryAliExpress("x", CFG, BASE_FIELDS,
+    fakeFetch({ aliexpress_affiliate_product_query_response: { resp_result: { resp_code: 200, result: { products: { product: [] } } } } })));
+  assert.deepEqual(r, { items: [], error: null });
+});
+
+test("queryAliExpress: success returns items", async () => {
+  const r = await quiet(() => queryAliExpress("x", CFG, BASE_FIELDS,
+    fakeFetch({ aliexpress_affiliate_product_query_response: { resp_result: { resp_code: 200, result: { products: { product: [{ product_id: 1 }] } } } } })));
+  assert.equal(r.items.length, 1);
+  assert.equal(r.error, null);
+});
+
+test("searchProducts surfaces the API error when nothing is found", async () => {
+  const deps = { toEnglish: async q => q, queryAliExpress: async () => ({ items: [], error: "API error: bad sign" }) };
+  const r = await quiet(() => searchProducts("headphones", CFG, deps));
+  assert.deepEqual(r.products, []);
+  assert.equal(r.error, "API error: bad sign");
 });
