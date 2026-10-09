@@ -18,8 +18,8 @@ const CFG = {
   appKey: APP_KEY,
   appSecret: APP_SECRET,
   trackingId: env("TRACKING_ID") || "deals48bot",
-  // بوابة /sync هي التي كانت تعمل مع النسخة السابقة؛ يمكن تغييرها من AE_GATEWAY
-  gateway: env("AE_GATEWAY") || "https://api.aliexpress.com/sync",
+  // البوابة الرسمية لـ aliexpress.affiliate.*؛ العنوان api.aliexpress.com هو موقع المتجر ويرجع صفحة "Maintaining"
+  gateway: env("AE_GATEWAY") || "https://api-sg.aliexpress.com/sync",
   shipTo: env("SHIP_TO_COUNTRY"), // مثال: IL
   currency: env("TARGET_CURRENCY"), // مثال: ILS
   language: env("TARGET_LANGUAGE") || "EN",
