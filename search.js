@@ -53,26 +53,69 @@ export function tokens(text) {
 // ---------- ترجمة الاستعلام للإنجليزية (علي إكسبرس أدق مع الإنجليزية) ----------
 const translationCache = new Map();
 
-export async function toEnglish(text, fetchImpl = fetch) {
+// مزوّدو ترجمة مجانيون. إن حُجب أحدهم (مثل 429 من عناوين Render) ننتقل للتالي ونتجنبه 5 دقائق.
+const COOLDOWN_MS = 5 * 60 * 1000;
+const blockedUntil = new Map();
+
+async function viaGoogle(t, fetchImpl) {
+  const url =
+    "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=" +
+    encodeURIComponent(t);
+  const res = await fetchImpl(url, { signal: AbortSignal.timeout(5000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  return (data?.[0] || []).map(seg => seg?.[0] || "").join("").trim();
+}
+
+// MyMemory لا يدعم الكشف التلقائي للغة، فنحدد العربية أو العبرية من الأحرف
+async function viaMyMemory(t, fetchImpl) {
+  const lang = /[\u0600-\u06FF]/.test(t) ? "ar" : /[\u0590-\u05FF]/.test(t) ? "he" : null;
+  if (!lang) throw new Error("unsupported script");
+  const url =
+    `https://api.mymemory.translated.net/get?langpair=${lang}|en&q=` + encodeURIComponent(t);
+  const res = await fetchImpl(url, { signal: AbortSignal.timeout(5000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  const text = (data?.responseData?.translatedText || "").trim();
+  // عند انتهاء الحصة المجانية يرجع نص تحذير بدل الترجمة، فلا نقبله
+  if (Number(data?.responseStatus) !== 200 || data?.quotaFinished || /^MYMEMORY WARNING/i.test(text)) {
+    throw new Error(`rejected (status ${data?.responseStatus})`);
+  }
+  return text;
+}
+
+const PROVIDERS = [
+  ["google", viaGoogle],
+  ["mymemory", viaMyMemory],
+];
+
+export async function toEnglish(text, fetchImpl = fetch, now = Date.now) {
   const t = (text || "").trim();
   if (!t || !NON_ASCII.test(t)) return t;
   if (translationCache.has(t)) return translationCache.get(t);
-  try {
-    const url =
-      "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=" +
-      encodeURIComponent(t);
-    const res = await fetchImpl(url, { signal: AbortSignal.timeout(5000) });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    const translated = (data?.[0] || []).map(seg => seg?.[0] || "").join("").trim();
-    if (translated) {
-      translationCache.set(t, translated); // لا نخزّن حالات الفشل
-      return translated;
+
+  for (const [name, fn] of PROVIDERS) {
+    if ((blockedUntil.get(name) || 0) > now()) continue;
+    try {
+      const translated = await fn(t, fetchImpl);
+      if (translated && !NON_ASCII.test(translated)) {
+        translationCache.set(t, translated); // لا نخزّن حالات الفشل
+        return translated;
+      }
+      throw new Error("empty or untranslated result");
+    } catch (err) {
+      console.warn(`translation via ${name} failed: ${err.message}`);
+      blockedUntil.set(name, now() + COOLDOWN_MS);
     }
-  } catch (err) {
-    console.warn("translation failed, using original query:", err.message);
   }
+  console.warn("all translation providers failed, using original query");
   return t;
+}
+
+// لاختبارات الوحدة فقط
+export function _resetTranslationState() {
+  translationCache.clear();
+  blockedUntil.clear();
 }
 
 // ---------- الصلة ----------
